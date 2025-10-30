@@ -112,8 +112,18 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       "Max loops",
       this.properties.maxLoops,
       (value) => this.setMaxLoops(value),
-      { min: 1, step: 1 }
+      { min: 1, step: 1, precision: 0 }
     );
+    if (this.maxLoopsWidget) {
+      this.maxLoopsWidget.options = {
+        ...this.maxLoopsWidget.options,
+        min: 1,
+        step: 1,
+        precision: 0,
+      };
+      this.maxLoopsWidget.serializeValue = (value) =>
+        Math.max(1, ensureInteger(value, 1));
+    }
     this.setMaxLoops(this.properties.maxLoops);
     this.addWidget("button", "Run", null, () => this.startExecution());
     this.addWidget("button", "Cancel", null, () => this.cancelExecution());
