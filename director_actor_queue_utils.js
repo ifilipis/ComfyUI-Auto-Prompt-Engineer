@@ -4,6 +4,8 @@ daeState.targetIds = daeState.targetIds || new Set();
 daeState.currentLinkId = daeState.currentLinkId || null;
 daeState.phase = daeState.phase || null;
 daeState.phaseGroupName = daeState.phaseGroupName || null;
+daeState.forceAnalyze = daeState.forceAnalyze || false;
+daeState.forceAnalyzeFeedback = daeState.forceAnalyzeFeedback || "";
 
 function normalizeNodeId(nodeId) {
   return nodeId != null ? String(nodeId) : "";
@@ -95,6 +97,12 @@ export function buildFilteredPrompt(originalBody, targetIdsIterable) {
         nodeData.class_type === "LatestImageSource"
       ) {
         nodeData.inputs.link_id = linkId;
+        if (nodeData.class_type === "DirectorGemini") {
+          nodeData.inputs.force_analyze = Boolean(daeState.forceAnalyze);
+          const feedback = daeState.forceAnalyzeFeedback;
+          nodeData.inputs.force_feedback =
+            typeof feedback === "string" ? feedback : "";
+        }
       }
     });
   }
