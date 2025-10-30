@@ -1,11 +1,14 @@
 import base64
 import io
 import json
-from typing import Any, Dict, List, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import numpy as np
 from PIL import Image
+
+from server import PromptServer
 
 # --- Gemini API Setup and Helpers ---
 
@@ -241,14 +244,198 @@ class PromptSwitch:
         return (current_prompt,)
 
 
+class DirectorGemini:
+    """Single-output Gemini director that coordinates prompt generation."""
+
+    CATEGORY = "Director/Gemini"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "execute"
+    OUTPUT_IS_LIST = (False,)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "instruction": ("STRING", {"default": "", "multiline": True}),
+                "initial_image": ("IMAGE",),
+                "model": ("STRING", {"default": "gemini-1.5-pro"}),
+                "api_key": ("STRING", {"default": ""}),
+                "history_json": ("STRING", {"default": "[]", "multiline": True}),
+                "link_id": ("STRING", {"default": ""}),
+            },
+            "optional": {
+                "latest_image": ("IMAGE",),
+            },
+        }
+
+    def _build_expand_contents(self, instruction: str, initial: Image.Image) -> Tuple[List[Dict[str, Any]], str]:
+        initial_part = _pil_to_inline_image(initial)
+        contents = [{"role": "user", "parts": [initial_part, {"text": instruction}]}]
+        return contents, _EXPAND_SYSTEM_INSTRUCTION
+
+    def _build_review_contents(
+        self,
+        instruction: str,
+        initial: Image.Image,
+        latest: Optional[Image.Image],
+        history: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        contents: List[Dict[str, Any]] = []
+        initial_part = _pil_to_inline_image(initial)
+        contents.append({"role": "user", "parts": [initial_part, {"text": f'My instruction is: "{instruction}"'}]})
+
+        for step in history:
+            b64_initial = step.get("initial") or step.get("input")
+            if isinstance(b64_initial, str) and b64_initial:
+                contents.append({"role": "user", "parts": [{"inline_data": {"mime_type": "image/png", "data": b64_initial}}]})
+
+            b64_image = step.get("image")
+            if isinstance(b64_image, str) and b64_image:
+                contents.append({"role": "model", "parts": [{"inline_data": {"mime_type": "image/png", "data": b64_image}}]})
+
+            analysis = step.get("analysisText") or step.get("analysis")
+            if isinstance(analysis, str) and analysis:
+                contents.append({"role": "model", "parts": [{"text": analysis}]})
+
+        if latest is not None:
+            contents.append({"role": "model", "parts": [_pil_to_inline_image(latest)]})
+
+        contents.append({
+            "role": "user",
+            "parts": [{"text": "Look at the image and analyze if you failed to follow the instruction. If everything is correct respond with SUCCESS, otherwise provide a corrective prompt."}]
+        })
+        return contents, _REVIEW_SYSTEM_INSTRUCTION
+
+    def _invoke_gemini(
+        self,
+        api_key: str,
+        model_name: str,
+        contents: List[Dict[str, Any]],
+        system_instruction: str,
+    ) -> str:
+        if api_key:
+            genai.configure(api_key=api_key)
+
+        model = genai.GenerativeModel(
+            model_name=model_name,
+            system_instruction=system_instruction,
+        )
+
+        response = model.generate_content(
+            contents,
+            generation_config=genai.types.GenerationConfig(temperature=0.7),
+        )
+        return _extract_text(response)
+
+    def execute(
+        self,
+        instruction: str,
+        initial_image: torch.Tensor,
+        model: str,
+        api_key: str,
+        history_json: str,
+        link_id: str,
+        latest_image: Optional[torch.Tensor] = None,
+    ):
+        prompt_output = ""
+        event_payload: Optional[Dict[str, Any]] = None
+
+        try:
+            initial_pil_list = tensor_to_pil(initial_image)
+            if not initial_pil_list:
+                raise ValueError("Initial image tensor is empty.")
+            initial_pil = initial_pil_list[0]
+
+            latest_pil: Optional[Image.Image] = None
+            if isinstance(latest_image, torch.Tensor):
+                latest_list = tensor_to_pil(latest_image)
+                if latest_list:
+                    latest_pil = latest_list[0]
+
+            history = _safe_json_loads(history_json)
+            mode = "expand" if latest_pil is None else "review"
+
+            if mode == "expand":
+                contents, sys_instruction = self._build_expand_contents(instruction, initial_pil)
+            else:
+                contents, sys_instruction = self._build_review_contents(instruction, initial_pil, latest_pil, history)
+
+            response_text = self._invoke_gemini(api_key, model, contents, sys_instruction).strip()
+
+            if mode == "expand":
+                prompt_output = response_text or instruction
+                event_payload = {"link_id": link_id, "done": False, "prompt": prompt_output}
+            else:
+                if response_text.upper() == "SUCCESS":
+                    prompt_output = "SUCCESS"
+                    event_payload = {"link_id": link_id, "done": True, "prompt": ""}
+                else:
+                    prompt_output = response_text
+                    event_payload = {"link_id": link_id, "done": False, "prompt": response_text}
+
+        except Exception as exc:  # noqa: BLE001
+            prompt_output = f"<director_error:{exc}>"
+            event_payload = {"link_id": link_id, "done": True, "prompt": prompt_output}
+
+        if event_payload:
+            PromptServer.instance.send_sync("director-status", event_payload)
+
+        return (prompt_output,)
+
+
+class ImageRouter:
+    """Persist images per iteration and notify the front-end."""
+
+    CATEGORY = "Director/IO"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "execute"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "link_id": ("STRING", {"default": ""}),
+                "persist_dir": ("STRING", {"default": "./director_actor"}),
+                "iter_tag": ("INT", {"default": 0, "min": 0}),
+            }
+        }
+
+    def execute(self, image: torch.Tensor, link_id: str, persist_dir: str, iter_tag: int):
+        images = tensor_to_pil(image)
+        if not images:
+            raise ValueError("No image data provided to ImageRouter.")
+
+        filename = f"iter_{int(iter_tag):04d}.png"
+        base_path = Path(persist_dir).expanduser()
+        if link_id:
+            base_path = base_path / link_id
+        target_path = (base_path / filename).resolve()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        images[0].save(target_path)
+
+        PromptServer.instance.send_sync(
+            "img-ready",
+            {"link_id": link_id, "path": str(target_path), "iter": int(iter_tag)},
+        )
+
+        return (image,)
+
+
 # --- Node Mappings for ComfyUI ---
 
 NODE_CLASS_MAPPINGS = {
     "GeminiDirector": GeminiDirector,
     "PromptSwitch": PromptSwitch,
+    "DirectorGemini": DirectorGemini,
+    "ImageRouter": ImageRouter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "GeminiDirector": "Gemini Director",
     "PromptSwitch": "Prompt Switch",
+    "DirectorGemini": "Director (Gemini, single prompt)",
+    "ImageRouter": "Image Router (persist + notify)",
 }
