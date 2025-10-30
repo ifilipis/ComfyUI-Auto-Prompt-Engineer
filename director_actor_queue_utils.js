@@ -63,6 +63,11 @@ export function buildFilteredPrompt(originalBody, targetIdsIterable) {
     collectRelatedNodes(promptGraph, rawId, collected);
   }
 
+  console.debug("[DirectorActor] Collected nodes for slicing", {
+    targets: Array.from(targetIdsIterable || []),
+    collected: Array.from(collected),
+  });
+
   const filtered = {};
   collected.forEach((id) => {
     if (promptGraph[id] != null) {
