@@ -2,6 +2,8 @@ const daeState = window.__DAE_state || (window.__DAE_state = {});
 
 daeState.targetIds = daeState.targetIds || new Set();
 daeState.currentLinkId = daeState.currentLinkId || null;
+daeState.phase = daeState.phase || null;
+daeState.phaseGroupName = daeState.phaseGroupName || null;
 
 function normalizeNodeId(nodeId) {
   return nodeId != null ? String(nodeId) : "";
@@ -65,6 +67,8 @@ export function buildFilteredPrompt(originalBody, targetIdsIterable) {
   }
 
   console.debug("[DirectorActor] Collected nodes for slicing", {
+    phase: daeState.phase,
+    group: daeState.phaseGroupName,
     targets: Array.from(targetIdsIterable || []),
     collected: Array.from(collected),
   });

@@ -9,6 +9,12 @@ daeState.executors = daeState.executors || new Set();
 daeState.activeCount = daeState.activeCount || 0;
 daeState.active = daeState.active || false;
 daeState.currentLinkId = daeState.currentLinkId || null;
+daeState.phase = daeState.phase || null;
+daeState.phaseGroupName = daeState.phaseGroupName || null;
+daeState.phaseTargetIds = daeState.phaseTargetIds || new Set();
+daeState.phaseTargetSummary = daeState.phaseTargetSummary || [];
+daeState.directorOutputId = daeState.directorOutputId || null;
+daeState.stopOnSuccess = daeState.stopOnSuccess || false;
 
 defineInterruptHooks();
 
@@ -86,6 +92,128 @@ function updateTargetIds(ids) {
   ids.forEach((id) => daeState.targetIds.add(id));
 }
 
+function rectContainsRect(container, rect) {
+  if (!Array.isArray(container) || !Array.isArray(rect)) {
+    return false;
+  }
+  const [cx, cy, cw, ch] = container;
+  const [rx, ry, rw, rh] = rect;
+  return (
+    rx >= cx &&
+    ry >= cy &&
+    rx + (rw || 0) <= cx + cw &&
+    ry + (rh || 0) <= cy + ch
+  );
+}
+
+function isNodeInsideGroupStrict(node, group) {
+  if (!node || !group) {
+    return false;
+  }
+
+  if (typeof group.isNodeInside === "function") {
+    try {
+      if (group.isNodeInside(node)) {
+        return true;
+      }
+    } catch (error) {
+      console.warn("[DirectorActor] group.isNodeInside failed", error);
+    }
+  }
+
+  const groupRect = getRect(group);
+  const nodeRect = getRect(node);
+
+  if (rectContainsRect(groupRect, nodeRect)) {
+    return true;
+  }
+
+  if (typeof group.isPointInside === "function") {
+    const [nx, ny, nw, nh] = nodeRect;
+    const corners = [
+      [nx, ny],
+      [nx + (nw || 0), ny],
+      [nx, ny + (nh || 0)],
+      [nx + (nw || 0), ny + (nh || 0)],
+    ];
+    try {
+      return corners.every(([x, y]) => group.isPointInside(x, y, 0));
+    } catch (error) {
+      console.warn("[DirectorActor] group.isPointInside failed", error);
+    }
+  }
+
+  return false;
+}
+
+function getNodeGroupTitles(node) {
+  const groups = app.graph?._groups || [];
+  const titles = [];
+  for (const group of groups) {
+    if (!group) {
+      continue;
+    }
+    try {
+      if (isNodeInsideGroupStrict(node, group)) {
+        titles.push(group?.title || "");
+      }
+    } catch (error) {
+      console.warn("[DirectorActor] Failed to inspect group membership", error);
+    }
+  }
+  return titles;
+}
+
+function setPhaseContext(phase, groupName, nodes) {
+  daeState.phase = phase;
+  daeState.phaseGroupName = groupName;
+  if (!daeState.phaseTargetIds) {
+    daeState.phaseTargetIds = new Set();
+  } else {
+    daeState.phaseTargetIds.clear();
+  }
+
+  const numericIds = [];
+  const audit = [];
+  for (const node of nodes || []) {
+    if (!node || node.id == null) {
+      continue;
+    }
+    numericIds.push(node.id);
+    daeState.phaseTargetIds.add(String(node.id));
+    audit.push({
+      id: node.id,
+      title: node.title,
+      groups: getNodeGroupTitles(node),
+    });
+  }
+
+  if (phase === "director") {
+    daeState.directorOutputId = audit.length ? String(audit[0].id) : null;
+  }
+
+  daeState.phaseTargetSummary = audit;
+  updateTargetIds(numericIds);
+
+  debugLog("Phase target audit", {
+    phase,
+    group: groupName,
+    targets: audit,
+  });
+}
+
+function clearPhaseContext() {
+  daeState.phase = null;
+  daeState.phaseGroupName = null;
+  daeState.directorOutputId = null;
+  daeState.phaseTargetSummary = [];
+  if (daeState.phaseTargetIds) {
+    daeState.phaseTargetIds.clear();
+  } else {
+    daeState.phaseTargetIds = new Set();
+  }
+}
+
 function debugLog(message, payload) {
   console.debug(`[DirectorActor] ${message}`, payload || "");
 }
@@ -106,6 +234,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       status: "Idle",
     };
     this.lastDirectorStatus = null;
+    this.stopGateEngaged = false;
     this.size = [320, 180];
     this.maxLoopsWidget = this.addWidget(
       "number",
@@ -162,6 +291,10 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       return;
     }
 
+    clearPhaseContext();
+    daeState.stopOnSuccess = false;
+    this.stopGateEngaged = false;
+
     this.resetSessionLink();
     debugLog("Run requested", { linkId: this.properties.linkId });
 
@@ -204,6 +337,9 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       debugLog("Director status received", resolvedStatus);
       const actorDecision = this.evaluateDirectorStatus(resolvedStatus, iteration);
       if (!actorDecision.runActor) {
+        if (this.stopGateEngaged) {
+          await this.interruptIfQueueBusy();
+        }
         this.properties.iter = iteration + 1;
         this.updateStatus(actorDecision.statusText);
         break;
@@ -260,6 +396,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
 
     if (status.done === true) {
       debugLog("Director reported done, skipping actor", { iteration, status });
+      this.engageStopGate("done");
       return {
         runActor: false,
         statusText: "Director completed",
@@ -272,6 +409,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
         iteration,
         prompt: promptText,
       });
+      this.engageStopGate("success");
       return {
         runActor: false,
         statusText: "Director SUCCESS",
@@ -287,43 +425,125 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       throw new Error(`No output nodes found in group "${groupName}"`);
     }
 
+    const phase = this.resolvePhase(groupName);
+    const phaseNodes = this.normalizePhaseTargets(phase, outputNodes, groupName);
+    if (!phaseNodes.length) {
+      throw new Error(`No valid output targets resolved for group "${groupName}"`);
+    }
+
     daeState.currentLinkId = this.ensureLinkId();
-    const nodeIds = outputNodes.map((node) => node.id);
-    updateTargetIds(nodeIds);
+    setPhaseContext(phase, groupName, phaseNodes);
+    const nodeIds = phaseNodes.map((node) => node.id);
 
     try {
-      const needsFinalWait = await this.queueNodes(nodeIds, outputNodes);
+      const needsFinalWait = await this.queueNodes(nodeIds, phaseNodes, phase);
       if (needsFinalWait) {
         await this.waitForQueueIdle();
       }
     } finally {
       daeState.targetIds.clear();
+      clearPhaseContext();
     }
   }
 
-  async queueNodes(nodeIds, nodes) {
+  async queueNodes(nodeIds, nodes, phase) {
+    if (this.stopGateEngaged || daeState.stopOnSuccess) {
+      debugLog("Stop gate active, skipping queue dispatch", {
+        phase,
+        nodeIds,
+      });
+      return false;
+    }
+
     if (window.rgthree?.queueOutputNodes) {
-      debugLog("Using rgthree queueOutputNodes", nodeIds);
+      debugLog("Using rgthree queueOutputNodes", { phase, nodeIds });
       await window.rgthree.queueOutputNodes(nodeIds);
       return true;
     }
 
+    const allowedIds = new Set((nodes || []).map((node) => node?.id));
     for (const node of nodes) {
       if (this.properties.isCancelling) {
         break;
       }
+      if (!allowedIds.has(node?.id)) {
+        debugLog("Skipping node outside phase targets", { phase, node: node?.id });
+        continue;
+      }
       if (typeof node.triggerQueue === "function") {
-        debugLog("Triggering node queue", { node: node.id });
+        debugLog("Triggering node queue", { node: node.id, phase });
         await node.triggerQueue();
         await this.waitForQueueIdle();
       } else {
-        debugLog("Falling back to app.queuePrompt", { node: node.id });
+        debugLog("Falling back to app.queuePrompt", { node: node.id, phase });
+        if (daeState.stopOnSuccess) {
+          debugLog("Stop gate prevented fallback queue", { node: node.id });
+          break;
+        }
         await app.queuePrompt();
         await this.waitForQueueIdle();
       }
     }
 
     return false;
+  }
+
+  resolvePhase(groupName) {
+    if (groupName === this.properties.directorGroupName) {
+      return "director";
+    }
+    if (groupName === this.properties.actorGroupName) {
+      return "actor";
+    }
+    return "unknown";
+  }
+
+  normalizePhaseTargets(phase, nodes, groupName) {
+    const available = Array.isArray(nodes) ? nodes.filter(Boolean) : [];
+    if (phase === "director" && available.length > 1) {
+      const preferred =
+        available.find((node) =>
+          String(node?.title || "").toLowerCase().includes("director")
+        ) || available[0];
+      debugLog("Director phase limited to single output", {
+        group: groupName,
+        preferred: preferred?.id,
+        candidates: available.map((node) => node?.id),
+      });
+      return preferred ? [preferred] : [];
+    }
+    return available;
+  }
+
+  engageStopGate(reason) {
+    if (this.stopGateEngaged) {
+      return;
+    }
+    this.stopGateEngaged = true;
+    daeState.stopOnSuccess = true;
+    debugLog("Stop gate engaged", { reason });
+  }
+
+  async interruptIfQueueBusy() {
+    try {
+      const response = await api.fetchApi("/queue");
+      if (!response?.ok) {
+        return;
+      }
+      const data = await response.json();
+      const running = data?.queue_running?.length || 0;
+      const pending = data?.queue_pending?.length || 0;
+      if (running > 0 || pending > 0) {
+        debugLog("Stop gate interrupting active queue", { running, pending });
+        try {
+          await api.fetchApi("/interrupt", { method: "POST" });
+        } catch (error) {
+          console.warn("[DirectorActor] Stop gate interrupt failed", error);
+        }
+      }
+    } catch (error) {
+      console.warn("[DirectorActor] Failed to inspect queue for stop gate", error);
+    }
   }
 
   async waitForQueueIdle() {
@@ -360,13 +580,12 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       throw new Error(`Group "${groupName}" not found`);
     }
 
-    const groupRect = getRect(group);
     const nodesInGroup = [];
     for (const node of app.graph._nodes || []) {
-      if (!node || !node.pos) {
+      if (!node) {
         continue;
       }
-      if (overlapRect(groupRect, getRect(node))) {
+      if (isNodeInsideGroupStrict(node, group)) {
         nodesInGroup.push(node);
       }
     }
@@ -456,6 +675,9 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
 
   cleanupAfterExecution() {
     this.detachEventListeners();
+    clearPhaseContext();
+    daeState.stopOnSuccess = false;
+    this.stopGateEngaged = false;
     daeState.executors.delete(this);
     daeState.activeCount = Math.max(0, daeState.activeCount - 1);
     if (daeState.activeCount === 0) {
