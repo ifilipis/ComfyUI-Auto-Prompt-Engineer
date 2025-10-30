@@ -462,27 +462,43 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     }
 
     const allowedIds = new Set((nodes || []).map((node) => node?.id));
+    const triggerable = [];
+    const fallback = [];
+
     for (const node of nodes) {
-      if (this.properties.isCancelling) {
-        break;
-      }
       if (!allowedIds.has(node?.id)) {
         debugLog("Skipping node outside phase targets", { phase, node: node?.id });
         continue;
       }
       if (typeof node.triggerQueue === "function") {
-        debugLog("Triggering node queue", { node: node.id, phase });
-        await node.triggerQueue();
-        await this.waitForQueueIdle();
+        triggerable.push(node);
       } else {
-        debugLog("Falling back to app.queuePrompt", { node: node.id, phase });
-        if (daeState.stopOnSuccess) {
-          debugLog("Stop gate prevented fallback queue", { node: node.id });
-          break;
-        }
-        await app.queuePrompt();
-        await this.waitForQueueIdle();
+        fallback.push(node);
       }
+    }
+
+    for (const node of triggerable) {
+      if (this.properties.isCancelling) {
+        break;
+      }
+      debugLog("Triggering node queue", { node: node.id, phase });
+      await node.triggerQueue();
+      await this.waitForQueueIdle();
+    }
+
+    if (this.properties.isCancelling) {
+      return false;
+    }
+
+    if (fallback.length > 0) {
+      const fallbackIds = fallback.map((node) => node.id);
+      debugLog("Falling back to app.queuePrompt", { phase, nodes: fallbackIds });
+      if (daeState.stopOnSuccess) {
+        debugLog("Stop gate prevented fallback queue", { nodes: fallbackIds });
+        return false;
+      }
+      await app.queuePrompt();
+      await this.waitForQueueIdle();
     }
 
     return false;

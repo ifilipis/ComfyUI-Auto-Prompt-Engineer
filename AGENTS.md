@@ -7,6 +7,7 @@ You are creating a custom ComfyUI node. You must update this document with issue
 - Session boundaries must reset with each executor run so prior prompts do not leak.
 - Director executor must wait for explicit Gemini status updates before scheduling actors so SUCCESS halts the loop cleanly.
 - Hidden link routing inputs should stay internal to avoid exposing manual wiring in the graph UI.
+- Fallback queuing must dispatch each phase only once so actor targets do not double-submit and block director reruns.
 
 ## Goals
 - Provide a single-output Gemini director node that emits control events.
@@ -24,3 +25,4 @@ You are creating a custom ComfyUI node. You must update this document with issue
 - Internalize storage parameters, append iteration history automatically, and surface loop count controls on the executor UI.
 - Reset executor link IDs on Run to start fresh sessions and mirror the new debug outputs.
 - Clamp executor loop counts to integers and log the wait for director status before each actor pass.
+- Ensure manual queue fallbacks coalesce their targets per phase before dispatching to avoid duplicate runs.
