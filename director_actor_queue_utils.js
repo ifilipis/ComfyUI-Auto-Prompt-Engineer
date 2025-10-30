@@ -6,6 +6,22 @@ function normalizeNodeId(nodeId) {
   return nodeId != null ? String(nodeId) : "";
 }
 
+function shouldSkipNode(node, id) {
+  if (!node) {
+    console.warn(`[DirectorActor] Missing node ${id} while slicing prompt`);
+    return true;
+  }
+  if (node.disabled === true) {
+    console.warn(`[DirectorActor] Skipping disabled node ${id}`);
+    return true;
+  }
+  if (typeof node.mode === "number" && node.mode === 4) {
+    console.warn(`[DirectorActor] Skipping node ${id} with mode=4`);
+    return true;
+  }
+  return false;
+}
+
 export function collectRelatedNodes(promptGraph, nodeId, collected = new Set()) {
   const id = normalizeNodeId(nodeId);
   if (!id || collected.has(id)) {
@@ -13,7 +29,7 @@ export function collectRelatedNodes(promptGraph, nodeId, collected = new Set()) 
   }
 
   const node = promptGraph?.[id];
-  if (!node) {
+  if (shouldSkipNode(node, id)) {
     return collected;
   }
 
@@ -22,14 +38,15 @@ export function collectRelatedNodes(promptGraph, nodeId, collected = new Set()) 
   const inputs = node.inputs || {};
   for (const value of Object.values(inputs)) {
     if (Array.isArray(value) && value.length > 0) {
-      if (Array.isArray(value[0])) {
+      const first = value[0];
+      if (Array.isArray(first)) {
         for (const connection of value) {
           if (Array.isArray(connection) && connection.length > 0) {
             collectRelatedNodes(promptGraph, connection[0], collected);
           }
         }
       } else {
-        collectRelatedNodes(promptGraph, value[0], collected);
+        collectRelatedNodes(promptGraph, first, collected);
       }
     }
   }

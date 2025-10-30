@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -129,6 +130,20 @@ class DirectorGemini:
                 "latest_image": ("IMAGE",),
             },
         }
+
+    @classmethod
+    def IS_CHANGED(
+        cls,
+        instruction: str,
+        initial_image: torch.Tensor,
+        model: str,
+        api_key: str,
+        history_json: str,
+        link_id: str,
+        latest_image: Optional[torch.Tensor] = None,
+    ) -> float:
+        # Force ComfyUI to treat the node as changed every pass so the director reruns.
+        return float("nan")
 
     @staticmethod
     def _build_expand_contents(
