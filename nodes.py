@@ -325,6 +325,7 @@ class ImageRouterSink:
     """Persist images, update the latest pointer, and notify the front-end."""
 
     CATEGORY = "Director/IO"
+    OUTPUT_NODE = True
     RETURN_TYPES = ()
     RETURN_NAMES = ()
     FUNCTION = "execute"
