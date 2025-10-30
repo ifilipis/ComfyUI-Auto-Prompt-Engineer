@@ -1,3 +1,5 @@
+import { app } from "/scripts/app.js";
+
 const daeState = window.__DAE_state || (window.__DAE_state = {});
 
 daeState.targetIds = daeState.targetIds || new Set();
@@ -64,9 +66,58 @@ export function buildFilteredPrompt(originalBody, targetIdsIterable) {
     collectRelatedNodes(promptGraph, rawId, collected);
   }
 
+  const groupMembership = {};
+  const phase = daeState.phase;
+  const phaseGroup = daeState.phaseGroupName;
+  if (app?.graph) {
+    const groups = app.graph._groups || [];
+    const getRect = (entity) => {
+      if (!entity) {
+        return [0, 0, 0, 0];
+      }
+      if (typeof entity.getBounding === "function") {
+        return entity.getBounding();
+      }
+      const pos = entity.pos || [0, 0];
+      const size = entity.size || [0, 0];
+      return [pos[0], pos[1], size[0], size[1]];
+    };
+    const rectContains = (container, inner) => {
+      const [cx, cy, cw, ch] = container;
+      const [ix, iy, iw, ih] = inner;
+      if (cw <= 0 || ch <= 0) {
+        return false;
+      }
+      const insideX = ix >= cx && ix + iw <= cx + cw;
+      const insideY = iy >= cy && iy + ih <= cy + ch;
+      return insideX && insideY;
+    };
+
+    collected.forEach((id) => {
+      const numericId = Number(id);
+      const node =
+        app.graph.getNodeById?.(numericId) ||
+        (app.graph._nodes || []).find((candidate) => candidate?.id === numericId);
+      if (!node) {
+        return;
+      }
+      const nodeRect = getRect(node);
+      for (const group of groups) {
+        if (rectContains(getRect(group), nodeRect)) {
+          groupMembership[id] = group?.title || null;
+          return;
+        }
+      }
+      groupMembership[id] = null;
+    });
+  }
+
   console.debug("[DirectorActor] Collected nodes for slicing", {
+    phase,
+    group: phaseGroup,
     targets: Array.from(targetIdsIterable || []),
     collected: Array.from(collected),
+    groups: groupMembership,
   });
 
   const filtered = {};

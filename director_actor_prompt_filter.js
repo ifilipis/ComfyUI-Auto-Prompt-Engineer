@@ -17,6 +17,7 @@ if (!daeState.__promptFilterPatched) {
       path === "/prompt" &&
       requestOptions?.method?.toUpperCase() === "POST" &&
       daeState.active &&
+      !daeState.stopRequested &&
       daeState.targetIds &&
       daeState.targetIds.size > 0
     ) {
@@ -27,10 +28,50 @@ if (!daeState.__promptFilterPatched) {
           const extra = parsed.extra_data || {};
 
           if (!extra.isDirectorActorRequest) {
+            const allowedTargets = daeState.allowedTargetIds || new Set();
+            const originalTargets = Array.from(daeState.targetIds || []);
+            const sanitizedTargets = [];
+            for (const id of originalTargets) {
+              if (allowedTargets.size === 0 || allowedTargets.has(id)) {
+                sanitizedTargets.push(id);
+              } else {
+                console.error("[DirectorActor] Dropping target outside active group", {
+                  id,
+                  phase: daeState.phase,
+                  group: daeState.phaseGroupName,
+                });
+              }
+            }
+
+            if (daeState.phase === "director" && sanitizedTargets.length > 1) {
+              console.error("[DirectorActor] Director phase received multiple targets", {
+                phase: daeState.phase,
+                group: daeState.phaseGroupName,
+                sanitizedTargets,
+              });
+              sanitizedTargets.splice(1);
+            }
+
+            if (sanitizedTargets.length === 0) {
+              console.error("[DirectorActor] No valid targets after sanitization; skipping filter", {
+                phase: daeState.phase,
+                group: daeState.phaseGroupName,
+                originalTargets,
+              });
+              return originalFetchApi(path, requestOptions);
+            }
+
+            daeState.targetIds.clear();
+            sanitizedTargets.forEach((id) => daeState.targetIds.add(id));
+
             console.debug("[DirectorActor] Filtering prompt request", {
               path,
+              phase: daeState.phase,
+              group: daeState.phaseGroupName,
               targetCount: daeState.targetIds.size,
+              targetIds: sanitizedTargets,
             });
+
             const filtered = buildFilteredPrompt(parsed, daeState.targetIds);
             filtered.extra_data = { ...extra, isDirectorActorRequest: true };
             requestOptions = {
