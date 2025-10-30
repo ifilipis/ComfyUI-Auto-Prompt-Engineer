@@ -8,6 +8,7 @@ import json
 import math
 import os
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -52,6 +53,101 @@ If you have perfectly followed the instruction, respond with only the word 'SUCC
 If you have failed, you must change your strategy. DO NOT repeat the same prompt. Your output must be an updated prompt that points out the previous failure and suggests a corrective action. Do not add conversational text or formatting—your output must be a PROMPT ONLY."""
 
 
+_PERSIST_DIR = os.environ.get("DIRECTOR_ACTOR_PERSIST_DIR", "./director_actor")
+_HISTORY_FILENAME = "history.json"
+_SESSION_FILENAME = "session.json"
+_LATEST_IMAGE_NAME = "latest.png"
+
+
+def _resolve_persist_root() -> Path:
+    return Path(os.path.expanduser(_PERSIST_DIR)).resolve()
+
+
+def _resolve_group_dir(link_id: str) -> Path:
+    root = _resolve_persist_root()
+    return root / link_id if link_id else root
+
+
+def _history_path(group_dir: Path) -> Path:
+    return group_dir / _HISTORY_FILENAME
+
+
+def _session_path(group_dir: Path) -> Path:
+    return group_dir / _SESSION_FILENAME
+
+
+def _load_history_entries(group_dir: Path) -> List[Dict[str, Any]]:
+    history_file = _history_path(group_dir)
+    try:
+        with history_file.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError:
+        return []
+
+    if isinstance(data, list):
+        return [entry for entry in data if isinstance(entry, dict)]
+    return []
+
+
+def _save_history_entries(group_dir: Path, entries: Iterable[Dict[str, Any]]) -> None:
+    group_dir.mkdir(parents=True, exist_ok=True)
+    history_file = _history_path(group_dir)
+    serializable = [entry for entry in entries if isinstance(entry, dict)]
+    with history_file.open("w", encoding="utf-8") as handle:
+        json.dump(serializable, handle)
+
+
+def _load_session_state(group_dir: Path) -> Dict[str, Any]:
+    session_file = _session_path(group_dir)
+    try:
+        with session_file.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
+
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def _save_session_state(group_dir: Path, state: Dict[str, Any]) -> None:
+    group_dir.mkdir(parents=True, exist_ok=True)
+    session_file = _session_path(group_dir)
+    serializable = {k: v for k, v in state.items() if isinstance(k, str)}
+    with session_file.open("w", encoding="utf-8") as handle:
+        json.dump(serializable, handle)
+
+
+def _start_new_session(group_dir: Path, instruction: str) -> str:
+    session_id = uuid.uuid4().hex
+    state = {"session_id": session_id, "instruction": instruction or ""}
+    _save_session_state(group_dir, state)
+    latest_path = group_dir / _LATEST_IMAGE_NAME
+    try:
+        latest_path.unlink()
+    except FileNotFoundError:
+        pass
+    return session_id
+
+
+def _active_session_id(group_dir: Path) -> Optional[str]:
+    state = _load_session_state(group_dir)
+    session_id = state.get("session_id") if isinstance(state, dict) else None
+    return session_id if isinstance(session_id, str) and session_id else None
+
+
+def _encode_image_file(image_path: Path) -> Optional[str]:
+    try:
+        with image_path.open("rb") as handle:
+            return base64.b64encode(handle.read()).decode("utf-8")
+    except FileNotFoundError:
+        return None
+
+
 def _tensor_to_pil_list(tensor: torch.Tensor) -> List[Image.Image]:
     if not isinstance(tensor, torch.Tensor):
         return []
@@ -69,18 +165,6 @@ def _pil_to_inline_image(image: Image.Image) -> Dict[str, Any]:
     image.save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
     return {"inline_data": {"mime_type": "image/png", "data": encoded}}
-
-
-def _safe_json_list(text: str) -> List[Dict[str, Any]]:
-    if not text:
-        return []
-    try:
-        loaded = json.loads(text)
-    except json.JSONDecodeError:
-        return []
-    if isinstance(loaded, list):
-        return [entry for entry in loaded if isinstance(entry, dict)]
-    return []
 
 
 def _debug_log(message: str, **details: Any) -> None:
@@ -136,7 +220,6 @@ class DirectorGemini:
                 "initial_image": ("IMAGE",),
                 "model": ("STRING", {"default": "gemini-1.5-pro"}),
                 "api_key": ("STRING", {"default": ""}),
-                "history_json": ("STRING", {"default": "[]", "multiline": True}),
                 "link_id": ("STRING", {"default": ""}),
             },
             "optional": {
@@ -238,13 +321,79 @@ class DirectorGemini:
             # Front-end events should not break execution; swallow errors silently.
             pass
 
+    def _load_history_for_prompt(
+        self,
+        group_dir: Path,
+        session_id: Optional[str],
+        include_latest: bool,
+    ) -> List[Dict[str, Any]]:
+        if not session_id:
+            return []
+
+        entries = [
+            entry
+            for entry in _load_history_entries(group_dir)
+            if isinstance(entry, dict)
+            and entry.get("session_id") == session_id
+        ]
+
+        if not include_latest and entries:
+            entries = entries[:-1]
+
+        history: List[Dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            image_key = entry.get("image_path")
+            record: Dict[str, Any] = {}
+            if isinstance(image_key, str) and image_key:
+                encoded = _encode_image_file(group_dir / image_key)
+                if encoded:
+                    record["image"] = encoded
+            analysis_text = entry.get("analysisText")
+            if isinstance(analysis_text, str) and analysis_text.strip():
+                record["analysisText"] = analysis_text
+            if record:
+                history.append(record)
+        return history
+
+    def _update_latest_history_entry(
+        self,
+        group_dir: Path,
+        session_id: Optional[str],
+        response_text: str,
+        done: bool,
+    ) -> None:
+        if not session_id:
+            return
+
+        entries = _load_history_entries(group_dir)
+        if not entries:
+            return
+
+        session_indices = [
+            index
+            for index, entry in enumerate(entries)
+            if isinstance(entry, dict)
+            and entry.get("session_id") == session_id
+        ]
+        if not session_indices:
+            return
+
+        latest_index = session_indices[-1]
+        latest = entries[latest_index]
+        if not isinstance(latest, dict):
+            return
+        latest["analysisText"] = "SUCCESS" if done else response_text
+        entries[latest_index] = latest
+        _save_history_entries(group_dir, entries)
+
     def execute(
         self,
         instruction: str,
         initial_image: torch.Tensor,
         model: str,
         api_key: str,
-        history_json: str,
         link_id: str,
         latest_image: Optional[torch.Tensor] = None,
     ) -> Tuple[str]:
@@ -258,21 +407,32 @@ class DirectorGemini:
         event_prompt = ""
         done = False
 
+        group_dir = _resolve_group_dir(link_id)
+        session_id = _active_session_id(group_dir)
+        latest_pil: Optional[Image.Image] = None
         try:
             initial_images = _tensor_to_pil_list(initial_image)
             if not initial_images:
                 raise ValueError("Initial image tensor is empty.")
             _debug_log("Initial image processed", count=len(initial_images))
 
-            latest_pil: Optional[Image.Image] = None
             if latest_image is not None:
                 latest_list = _tensor_to_pil_list(latest_image)
                 if latest_list:
                     latest_pil = latest_list[0]
             _debug_log("Latest image state", available=latest_pil is not None)
 
-            history = _safe_json_list(history_json)
             mode = "expand" if latest_pil is None else "review"
+            if mode == "expand":
+                session_id = _start_new_session(group_dir, instruction)
+            elif not session_id:
+                session_id = _start_new_session(group_dir, instruction)
+
+            history = self._load_history_for_prompt(
+                group_dir,
+                session_id,
+                include_latest=latest_pil is None,
+            )
             _debug_log("Resolved mode", mode=mode, history_entries=len(history))
 
             if mode == "expand":
@@ -313,6 +473,8 @@ class DirectorGemini:
             _debug_log("Execute failed", error=str(exc))
 
         self._send_event(link_id, done, event_prompt)
+        if latest_pil is not None:
+            self._update_latest_history_entry(group_dir, session_id, prompt_output, done)
         _debug_log(
             "Execute completed",
             done=done,
@@ -336,8 +498,6 @@ class ImageRouterSink:
             "required": {
                 "image": ("IMAGE",),
                 "link_id": ("STRING", {"default": ""}),
-                "persist_dir": ("STRING", {"default": "./director_actor"}),
-                "iter": ("INT", {"default": 0, "min": 0}),
             }
         }
 
@@ -375,30 +535,59 @@ class ImageRouterSink:
                 except FileNotFoundError:
                     pass
 
+    @staticmethod
+    def _next_iteration(group_dir: Path, session_id: Optional[str]) -> int:
+        if not session_id:
+            return 0
+
+        entries = [
+            entry
+            for entry in _load_history_entries(group_dir)
+            if isinstance(entry, dict)
+            and entry.get("session_id") == session_id
+        ]
+        if not entries:
+            return 0
+        last = entries[-1]
+        if isinstance(last, dict) and isinstance(last.get("iteration"), int):
+            return last["iteration"] + 1
+        return len(entries)
+
     def execute(
         self,
         image: torch.Tensor,
         link_id: str,
-        persist_dir: str,
-        iter: int,
     ) -> Tuple[()]:
         pil_images = _tensor_to_pil_list(image)
         if not pil_images:
             raise ValueError("ImageRouterSink received an empty image tensor.")
 
-        base_path = Path(os.path.expanduser(persist_dir)).resolve()
-        if link_id:
-            base_path = base_path / link_id
+        base_path = _resolve_group_dir(link_id)
         base_path.mkdir(parents=True, exist_ok=True)
 
-        filename = f"iter_{int(iter):04d}.png"
+        session_id = _active_session_id(base_path)
+        if not session_id:
+            session_id = _start_new_session(base_path, "")
+
+        iteration = self._next_iteration(base_path, session_id)
+        filename = f"iter_{int(iteration):04d}.png"
         iteration_path = base_path / filename
         pil_images[0].save(iteration_path, format="PNG")
 
-        latest_path = base_path / "latest.png"
+        latest_path = base_path / _LATEST_IMAGE_NAME
         self._atomic_update_latest(pil_images[0], latest_path)
 
-        self._notify(link_id, iteration_path.resolve(), latest_path.resolve(), int(iter))
+        entries = _load_history_entries(base_path)
+        entries.append(
+            {
+                "session_id": session_id,
+                "iteration": int(iteration),
+                "image_path": filename,
+            }
+        )
+        _save_history_entries(base_path, entries)
+
+        self._notify(link_id, iteration_path.resolve(), latest_path.resolve(), int(iteration))
         return tuple()
 
 
@@ -414,34 +603,14 @@ class LatestImageSource:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "latest_path": (
-                    "STRING",
-                    {"default": "${persist_dir}/${link_id}/latest.png"},
-                ),
-                "persist_dir": ("STRING", {"default": "./director_actor"}),
                 "link_id": ("STRING", {"default": ""}),
             }
         }
 
     @staticmethod
-    def _resolve_path(latest_path: str, persist_dir: str, link_id: str) -> Path:
-        persist_root = Path(os.path.expanduser(persist_dir)).resolve()
-        group_dir = persist_root / link_id if link_id else persist_root
-
-        candidate = (latest_path or "").strip()
-        if candidate:
-            candidate = candidate.replace("${persist_dir}", str(persist_root))
-            candidate = candidate.replace("${link_id}", link_id)
-            resolved = Path(os.path.expanduser(candidate))
-            if not resolved.is_absolute():
-                base = group_dir if link_id else persist_root
-                resolved = base.joinpath(resolved).resolve()
-            else:
-                resolved = resolved.resolve()
-        else:
-            resolved = (group_dir / "latest.png").resolve()
-
-        return resolved
+    def _resolve_path(link_id: str) -> Path:
+        group_dir = _resolve_group_dir(link_id)
+        return (group_dir / _LATEST_IMAGE_NAME).resolve()
 
     @staticmethod
     def _load_tensor_from_image(image_path: Path) -> torch.Tensor:
@@ -457,11 +626,9 @@ class LatestImageSource:
     @classmethod
     def IS_CHANGED(
         cls,
-        latest_path: str,
-        persist_dir: str,
         link_id: str,
     ) -> str:
-        resolved = cls._resolve_path(latest_path, persist_dir, link_id)
+        resolved = cls._resolve_path(link_id)
         try:
             stat = resolved.stat()
         except FileNotFoundError:
@@ -470,11 +637,9 @@ class LatestImageSource:
 
     def load(
         self,
-        latest_path: str,
-        persist_dir: str,
         link_id: str,
     ) -> Tuple[torch.Tensor]:
-        resolved = self._resolve_path(latest_path, persist_dir, link_id)
+        resolved = self._resolve_path(link_id)
         if not resolved.exists():
             return (torch.zeros((0,), dtype=torch.float32),)
         tensor = self._load_tensor_from_image(resolved)

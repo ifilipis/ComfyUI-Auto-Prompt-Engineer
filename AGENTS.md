@@ -3,11 +3,13 @@ You are creating a custom ComfyUI node. You must update this document with issue
 ## Issues
 - Need director/actor orchestration to mirror LG_GroupExecutor behaviour without modifying restricted APIs.
 - Require lifecycle visibility to confirm Director node stages during execution.
+- Director loops must stop once Gemini emits SUCCESS and preserve conversation history across passes.
 
 ## Goals
 - Provide a single-output Gemini director node that emits control events.
 - Persist actor images via an Image Router node and notify the front-end.
 - Drive group execution loops and prompt slicing purely from front-end extensions.
+- Auto-manage persistence for history snapshots so review context survives between iterations.
 
 ## Tasks
 - Implement `DirectorGemini` and `ImageRouter` classes with required payloads and events.
@@ -16,3 +18,4 @@ You are creating a custom ComfyUI node. You must update this document with issue
 - Add queue slicing utilities plus `/prompt` interception to scope execution.
 - Create an executor node that manages run/cancel loops, queue polling, and debug logging.
 - Instrument DirectorGemini and front-end interceptors with concise debug output for every phase.
+- Internalize storage parameters, append iteration history automatically, and surface loop count controls on the executor UI.

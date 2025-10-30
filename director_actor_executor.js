@@ -98,8 +98,31 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     };
     this.lastDirectorStatus = null;
     this.size = [320, 180];
+    this.maxLoopsWidget = this.addWidget(
+      "number",
+      "Max loops",
+      this.properties.maxLoops,
+      (value) => this.setMaxLoops(value),
+      { min: 1, step: 1 }
+    );
+    this.setMaxLoops(this.properties.maxLoops);
     this.addWidget("button", "Run", null, () => this.startExecution());
     this.addWidget("button", "Cancel", null, () => this.cancelExecution());
+  }
+
+  setMaxLoops(value) {
+    const numeric = Number(value);
+    const sanitized = Math.max(1, Number.isFinite(numeric) ? Math.floor(numeric) : 1);
+    this.properties.maxLoops = sanitized;
+    if (this.maxLoopsWidget) {
+      this.maxLoopsWidget.value = sanitized;
+    }
+  }
+
+  onPropertyChanged(name, value) {
+    if (name === "maxLoops") {
+      this.setMaxLoops(value);
+    }
   }
 
   onDrawForeground(ctx) {
@@ -149,6 +172,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
 
     while (!this.properties.isCancelling && iteration < maxLoops) {
       this.lastDirectorStatus = null;
+      const statusWait = this.waitForDirectorSignal();
       debugLog("Queueing director group", { iteration });
       this.updateStatus(`Director pass ${iteration + 1}`);
       await this.queueGroupAndWait(this.properties.directorGroupName);
@@ -156,9 +180,14 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
         break;
       }
 
+      await statusWait;
       const directorStatus = this.lastDirectorStatus || { done: false, prompt: "" };
       debugLog("Director status received", directorStatus);
-      if (directorStatus.done || directorStatus.prompt === "SUCCESS") {
+      if (
+        directorStatus.done ||
+        (typeof directorStatus.prompt === "string" &&
+          directorStatus.prompt.toUpperCase() === "SUCCESS")
+      ) {
         this.updateStatus("Director signalled completion");
         break;
       }
@@ -179,6 +208,21 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
         await sleep(delayMs);
       }
     }
+  }
+
+  async waitForDirectorSignal(timeoutMs = 10000) {
+    const start = Date.now();
+    while (!this.properties.isCancelling) {
+      if (this.lastDirectorStatus) {
+        return this.lastDirectorStatus;
+      }
+      if (Date.now() - start >= timeoutMs) {
+        debugLog("Director status wait timed out", { timeoutMs });
+        return this.lastDirectorStatus;
+      }
+      await sleep(50);
+    }
+    return this.lastDirectorStatus;
   }
 
   async queueGroupAndWait(groupName) {
