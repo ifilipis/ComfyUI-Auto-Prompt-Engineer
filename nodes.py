@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -81,6 +83,48 @@ def _safe_json_list(text: str) -> List[Dict[str, Any]]:
     return []
 
 
+def _tensor_signature(tensor: Optional[torch.Tensor]) -> bytes:
+    if tensor is None:
+        return b"tensor:none"
+    if not isinstance(tensor, torch.Tensor):
+        return f"tensor:type:{type(tensor).__name__}".encode("utf-8")
+
+    if tensor.numel() == 0:
+        return f"tensor:empty:{tuple(tensor.shape)}:{tensor.dtype}".encode("utf-8")
+
+    cpu_tensor = tensor.detach().cpu().contiguous()
+    array = cpu_tensor.numpy()
+    hasher = hashlib.blake2b(digest_size=16)
+    hasher.update(str(array.shape).encode("utf-8"))
+    hasher.update(str(array.dtype).encode("utf-8"))
+    hasher.update(array.tobytes())
+    return hasher.digest()
+
+
+def _stable_hash(parts: Iterable[bytes]) -> float:
+    hasher = hashlib.blake2b(digest_size=8)
+    for part in parts:
+        if part:
+            hasher.update(part)
+
+    digest = hasher.digest()
+    # Reduce to 53 bits so the float conversion is lossless.
+    value = int.from_bytes(digest, "big") & ((1 << 53) - 1)
+    return float(value)
+
+
+def _debug_log(message: str, **details: Any) -> None:
+    prefix = "[DirectorGemini] "
+    if details:
+        try:
+            serialized = json.dumps(details, default=str)
+        except Exception:
+            serialized = str(details)
+        print(f"{prefix}{message}: {serialized}", flush=True)
+    else:
+        print(f"{prefix}{message}", flush=True)
+
+
 def _extract_response_text(response: Any) -> str:
     if response is None:
         return ""
@@ -129,6 +173,38 @@ class DirectorGemini:
                 "latest_image": ("IMAGE",),
             },
         }
+
+    @classmethod
+    def IS_CHANGED(
+        cls,
+        instruction: str,
+        initial_image: torch.Tensor,
+        model: str,
+        api_key: str,
+        history_json: str,
+        link_id: str,
+        latest_image: Optional[torch.Tensor] = None,
+    ) -> float:
+        instruction_bytes = (instruction or "").encode("utf-8")
+        model_bytes = (model or "").encode("utf-8")
+        api_key_bytes = (api_key or "").encode("utf-8")
+        history_bytes = (history_json or "").encode("utf-8")
+        link_bytes = (link_id or "").encode("utf-8")
+
+        initial_signature = _tensor_signature(initial_image)
+        latest_signature = _tensor_signature(latest_image)
+
+        return _stable_hash(
+            [
+                instruction_bytes,
+                model_bytes,
+                api_key_bytes,
+                history_bytes,
+                link_bytes,
+                initial_signature,
+                latest_signature,
+            ]
+        )
 
     @staticmethod
     def _build_expand_contents(
@@ -214,6 +290,7 @@ class DirectorGemini:
     def _send_event(link_id: str, done: bool, prompt: str) -> None:
         if not link_id:
             return
+        _debug_log("Sending director-status", done=done, prompt_preview=prompt[:80])
         try:
             PromptServer.instance.send_sync(
                 "director-status",
@@ -233,6 +310,12 @@ class DirectorGemini:
         link_id: str,
         latest_image: Optional[torch.Tensor] = None,
     ) -> Tuple[str]:
+        _debug_log(
+            "Execute called",
+            link_id=link_id,
+            has_latest=latest_image is not None,
+            instruction_chars=len(instruction or ""),
+        )
         prompt_output = ""
         event_prompt = ""
         done = False
@@ -241,15 +324,18 @@ class DirectorGemini:
             initial_images = _tensor_to_pil_list(initial_image)
             if not initial_images:
                 raise ValueError("Initial image tensor is empty.")
+            _debug_log("Initial image processed", count=len(initial_images))
 
             latest_pil: Optional[Image.Image] = None
             if latest_image is not None:
                 latest_list = _tensor_to_pil_list(latest_image)
                 if latest_list:
                     latest_pil = latest_list[0]
+            _debug_log("Latest image state", available=latest_pil is not None)
 
             history = _safe_json_list(history_json)
             mode = "expand" if latest_pil is None else "review"
+            _debug_log("Resolved mode", mode=mode, history_entries=len(history))
 
             if mode == "expand":
                 contents, system_instruction = self._build_expand_contents(
@@ -259,8 +345,14 @@ class DirectorGemini:
                 contents, system_instruction = self._build_review_contents(
                     instruction, initial_images[0], latest_pil, history
                 )
+            _debug_log("Built contents", parts=len(contents), system_instruction=system_instruction[:40])
 
             response_text = _call_gemini(api_key, model, contents, system_instruction).strip()
+            _debug_log(
+                "Gemini response received",
+                empty=not bool(response_text),
+                preview=response_text[:80],
+            )
 
             if mode == "expand":
                 prompt_output = response_text or instruction
@@ -280,8 +372,14 @@ class DirectorGemini:
             prompt_output = f"<director_error:{exc}>"
             event_prompt = prompt_output
             done = True
+            _debug_log("Execute failed", error=str(exc))
 
         self._send_event(link_id, done, event_prompt)
+        _debug_log(
+            "Execute completed",
+            done=done,
+            prompt_preview=prompt_output[:80],
+        )
         return (prompt_output,)
 
 

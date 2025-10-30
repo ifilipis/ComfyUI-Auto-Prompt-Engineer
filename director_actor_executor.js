@@ -145,6 +145,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     let iteration = 0;
 
     while (!this.properties.isCancelling && iteration < maxLoops) {
+      this.lastDirectorStatus = null;
       debugLog("Queueing director group", { iteration });
       this.updateStatus(`Director pass ${iteration + 1}`);
       await this.queueGroupAndWait(this.properties.directorGroupName);
@@ -187,12 +188,12 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     updateTargetIds(nodeIds);
 
     try {
-      await this.queueNodes(nodeIds, outputNodes);
-      await this.waitForQueueIdle();
-    } finally {
-      if (!this.properties.isExecuting || this.properties.isCancelling) {
-        daeState.targetIds.clear();
+      const needsFinalWait = await this.queueNodes(nodeIds, outputNodes);
+      if (needsFinalWait) {
+        await this.waitForQueueIdle();
       }
+    } finally {
+      daeState.targetIds.clear();
     }
   }
 
@@ -200,7 +201,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     if (window.rgthree?.queueOutputNodes) {
       debugLog("Using rgthree queueOutputNodes", nodeIds);
       await window.rgthree.queueOutputNodes(nodeIds);
-      return;
+      return true;
     }
 
     for (const node of nodes) {
@@ -210,11 +211,15 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       if (typeof node.triggerQueue === "function") {
         debugLog("Triggering node queue", { node: node.id });
         await node.triggerQueue();
+        await this.waitForQueueIdle();
       } else {
         debugLog("Falling back to app.queuePrompt", { node: node.id });
         await app.queuePrompt();
+        await this.waitForQueueIdle();
       }
     }
+
+    return false;
   }
 
   async waitForQueueIdle() {
@@ -259,6 +264,9 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
   }
 
   isOutputNode(node) {
+    if (!node || node.mode === LiteGraph.NEVER) {
+      return false;
+    }
     if (node?.constructor?.nodeData?.output_node) {
       return true;
     }
