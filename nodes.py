@@ -228,6 +228,14 @@ class DirectorGemini:
             },
             "optional": {
                 "latest_image": ("IMAGE",),
+                "expand_system_instruction": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
+                "review_system_instruction": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
             },
             "hidden": {
                 "link_id": ("STRING", {"default": ""}),
@@ -403,6 +411,8 @@ class DirectorGemini:
         api_key: str,
         link_id: str,
         latest_image: Optional[torch.Tensor] = None,
+        expand_system_instruction: str = "",
+        review_system_instruction: str = "",
     ) -> Tuple[str]:
         _debug_log(
             "Execute called",
@@ -447,14 +457,19 @@ class DirectorGemini:
                 session_id=session_id,
             )
 
+            expand_override = (expand_system_instruction or "").strip()
+            review_override = (review_system_instruction or "").strip()
+
             if mode == "expand":
                 contents, system_instruction = self._build_expand_contents(
                     instruction, initial_images[0]
                 )
+                system_instruction = expand_override or system_instruction
             else:
                 contents, system_instruction = self._build_review_contents(
                     instruction, initial_images[0], latest_pil, history
                 )
+                system_instruction = review_override or system_instruction
             _debug_log("Built contents", parts=len(contents), system_instruction=system_instruction[:40])
 
             response_text = _call_gemini(api_key, model, contents, system_instruction).strip()
