@@ -144,7 +144,8 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       return;
     }
 
-    this.ensureLinkId();
+    this.resetSessionLink();
+    debugLog("Run requested", { linkId: this.properties.linkId });
 
     this.properties.isExecuting = true;
     this.properties.isCancelling = false;
@@ -180,15 +181,12 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
         break;
       }
 
-      await statusWait;
-      const directorStatus = this.lastDirectorStatus || { done: false, prompt: "" };
+      const directorStatus = (await statusWait) || { done: false, prompt: "" };
       debugLog("Director status received", directorStatus);
-      if (
-        directorStatus.done ||
-        (typeof directorStatus.prompt === "string" &&
-          directorStatus.prompt.toUpperCase() === "SUCCESS")
-      ) {
-        this.updateStatus("Director signalled completion");
+      const actorDecision = this.evaluateDirectorStatus(directorStatus, iteration);
+      if (!actorDecision.runActor) {
+        this.properties.iter = iteration + 1;
+        this.updateStatus(actorDecision.statusText);
         break;
       }
 
@@ -210,6 +208,15 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     }
   }
 
+  resetSessionLink() {
+    const previousLinkId = this.properties.linkId;
+    this.properties.linkId = generateLinkId();
+    debugLog("Session link reset", {
+      previous: previousLinkId,
+      next: this.properties.linkId,
+    });
+  }
+
   async waitForDirectorSignal(timeoutMs = 10000) {
     const start = Date.now();
     while (!this.properties.isCancelling) {
@@ -223,6 +230,36 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       await sleep(50);
     }
     return this.lastDirectorStatus;
+  }
+
+  evaluateDirectorStatus(status, iteration) {
+    const defaultDecision = { runActor: true, statusText: "Director awaiting actor" };
+    if (!status) {
+      debugLog("Director status missing, continuing to actor", { iteration });
+      return defaultDecision;
+    }
+
+    if (status.done === true) {
+      debugLog("Director reported done, skipping actor", { iteration, status });
+      return {
+        runActor: false,
+        statusText: "Director completed",
+      };
+    }
+
+    const promptText = typeof status.prompt === "string" ? status.prompt.trim() : "";
+    if (promptText.toUpperCase() === "SUCCESS") {
+      debugLog("Director returned SUCCESS, skipping actor", {
+        iteration,
+        prompt: promptText,
+      });
+      return {
+        runActor: false,
+        statusText: "Director SUCCESS",
+      };
+    }
+
+    return defaultDecision;
   }
 
   async queueGroupAndWait(groupName) {

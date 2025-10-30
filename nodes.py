@@ -131,6 +131,11 @@ def _start_new_session(group_dir: Path, instruction: str) -> str:
         latest_path.unlink()
     except FileNotFoundError:
         pass
+    _debug_log(
+        "Starting new session",
+        link=str(group_dir),
+        session_id=session_id,
+    )
     return session_id
 
 

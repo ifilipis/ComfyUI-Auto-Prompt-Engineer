@@ -4,6 +4,7 @@ You are creating a custom ComfyUI node. You must update this document with issue
 - Need director/actor orchestration to mirror LG_GroupExecutor behaviour without modifying restricted APIs.
 - Require lifecycle visibility to confirm Director node stages during execution.
 - Director loops must stop once Gemini emits SUCCESS and preserve conversation history across passes.
+- Session boundaries must reset with each executor run so prior prompts do not leak.
 
 ## Goals
 - Provide a single-output Gemini director node that emits control events.
@@ -19,3 +20,4 @@ You are creating a custom ComfyUI node. You must update this document with issue
 - Create an executor node that manages run/cancel loops, queue polling, and debug logging.
 - Instrument DirectorGemini and front-end interceptors with concise debug output for every phase.
 - Internalize storage parameters, append iteration history automatically, and surface loop count controls on the executor UI.
+- Reset executor link IDs on Run to start fresh sessions and mirror the new debug outputs.
