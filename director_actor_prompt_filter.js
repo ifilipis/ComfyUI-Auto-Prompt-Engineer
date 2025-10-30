@@ -27,6 +27,10 @@ if (!daeState.__promptFilterPatched) {
           const extra = parsed.extra_data || {};
 
           if (!extra.isDirectorActorRequest) {
+            console.debug("[DirectorActor] Filtering prompt request", {
+              path,
+              targetCount: daeState.targetIds.size,
+            });
             const filtered = buildFilteredPrompt(parsed, daeState.targetIds);
             filtered.extra_data = { ...extra, isDirectorActorRequest: true };
             requestOptions = {

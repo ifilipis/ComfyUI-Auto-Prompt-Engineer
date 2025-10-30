@@ -8,6 +8,7 @@ daeState.targetIds = daeState.targetIds || new Set();
 daeState.executors = daeState.executors || new Set();
 daeState.activeCount = daeState.activeCount || 0;
 daeState.active = daeState.active || false;
+daeState.currentLinkId = daeState.currentLinkId || null;
 
 defineInterruptHooks();
 
@@ -120,6 +121,8 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       return;
     }
 
+    this.ensureLinkId();
+
     this.properties.isExecuting = true;
     this.properties.isCancelling = false;
     this.properties.iter = 0;
@@ -145,6 +148,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     let iteration = 0;
 
     while (!this.properties.isCancelling && iteration < maxLoops) {
+      this.lastDirectorStatus = null;
       debugLog("Queueing director group", { iteration });
       this.updateStatus(`Director pass ${iteration + 1}`);
       await this.queueGroupAndWait(this.properties.directorGroupName);
@@ -183,16 +187,17 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       throw new Error(`No output nodes found in group "${groupName}"`);
     }
 
+    daeState.currentLinkId = this.ensureLinkId();
     const nodeIds = outputNodes.map((node) => node.id);
     updateTargetIds(nodeIds);
 
     try {
-      await this.queueNodes(nodeIds, outputNodes);
-      await this.waitForQueueIdle();
-    } finally {
-      if (!this.properties.isExecuting || this.properties.isCancelling) {
-        daeState.targetIds.clear();
+      const needsFinalWait = await this.queueNodes(nodeIds, outputNodes);
+      if (needsFinalWait) {
+        await this.waitForQueueIdle();
       }
+    } finally {
+      daeState.targetIds.clear();
     }
   }
 
@@ -200,7 +205,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     if (window.rgthree?.queueOutputNodes) {
       debugLog("Using rgthree queueOutputNodes", nodeIds);
       await window.rgthree.queueOutputNodes(nodeIds);
-      return;
+      return true;
     }
 
     for (const node of nodes) {
@@ -210,11 +215,15 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       if (typeof node.triggerQueue === "function") {
         debugLog("Triggering node queue", { node: node.id });
         await node.triggerQueue();
+        await this.waitForQueueIdle();
       } else {
         debugLog("Falling back to app.queuePrompt", { node: node.id });
         await app.queuePrompt();
+        await this.waitForQueueIdle();
       }
     }
+
+    return false;
   }
 
   async waitForQueueIdle() {
@@ -238,6 +247,13 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     }
   }
 
+  ensureLinkId() {
+    if (!this.properties.linkId) {
+      this.properties.linkId = generateLinkId();
+    }
+    return this.properties.linkId;
+  }
+
   getGroupOutputNodes(groupName) {
     const group = app.graph?._groups?.find((g) => g?.title === groupName);
     if (!group) {
@@ -259,6 +275,9 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
   }
 
   isOutputNode(node) {
+    if (!node || node.mode === LiteGraph.NEVER) {
+      return false;
+    }
     if (node?.constructor?.nodeData?.output_node) {
       return true;
     }
@@ -342,6 +361,9 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     if (daeState.activeCount === 0) {
       daeState.active = false;
       daeState.targetIds.clear();
+    }
+    if (daeState.currentLinkId === this.properties.linkId) {
+      daeState.currentLinkId = null;
     }
     this.properties.isExecuting = false;
     this.properties.isCancelling = false;

@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -79,6 +81,18 @@ def _safe_json_list(text: str) -> List[Dict[str, Any]]:
     if isinstance(loaded, list):
         return [entry for entry in loaded if isinstance(entry, dict)]
     return []
+
+
+def _debug_log(message: str, **details: Any) -> None:
+    prefix = "[DirectorGemini] "
+    if details:
+        try:
+            serialized = json.dumps(details, default=str)
+        except Exception:
+            serialized = str(details)
+        print(f"{prefix}{message}: {serialized}", flush=True)
+    else:
+        print(f"{prefix}{message}", flush=True)
 
 
 def _extract_response_text(response: Any) -> str:
@@ -214,6 +228,7 @@ class DirectorGemini:
     def _send_event(link_id: str, done: bool, prompt: str) -> None:
         if not link_id:
             return
+        _debug_log("Sending director-status", done=done, prompt_preview=prompt[:80])
         try:
             PromptServer.instance.send_sync(
                 "director-status",
@@ -233,6 +248,12 @@ class DirectorGemini:
         link_id: str,
         latest_image: Optional[torch.Tensor] = None,
     ) -> Tuple[str]:
+        _debug_log(
+            "Execute called",
+            link_id=link_id,
+            has_latest=latest_image is not None,
+            instruction_chars=len(instruction or ""),
+        )
         prompt_output = ""
         event_prompt = ""
         done = False
@@ -241,15 +262,18 @@ class DirectorGemini:
             initial_images = _tensor_to_pil_list(initial_image)
             if not initial_images:
                 raise ValueError("Initial image tensor is empty.")
+            _debug_log("Initial image processed", count=len(initial_images))
 
             latest_pil: Optional[Image.Image] = None
             if latest_image is not None:
                 latest_list = _tensor_to_pil_list(latest_image)
                 if latest_list:
                     latest_pil = latest_list[0]
+            _debug_log("Latest image state", available=latest_pil is not None)
 
             history = _safe_json_list(history_json)
             mode = "expand" if latest_pil is None else "review"
+            _debug_log("Resolved mode", mode=mode, history_entries=len(history))
 
             if mode == "expand":
                 contents, system_instruction = self._build_expand_contents(
@@ -259,8 +283,14 @@ class DirectorGemini:
                 contents, system_instruction = self._build_review_contents(
                     instruction, initial_images[0], latest_pil, history
                 )
+            _debug_log("Built contents", parts=len(contents), system_instruction=system_instruction[:40])
 
             response_text = _call_gemini(api_key, model, contents, system_instruction).strip()
+            _debug_log(
+                "Gemini response received",
+                empty=not bool(response_text),
+                preview=response_text[:80],
+            )
 
             if mode == "expand":
                 prompt_output = response_text or instruction
@@ -280,15 +310,22 @@ class DirectorGemini:
             prompt_output = f"<director_error:{exc}>"
             event_prompt = prompt_output
             done = True
+            _debug_log("Execute failed", error=str(exc))
 
         self._send_event(link_id, done, event_prompt)
+        _debug_log(
+            "Execute completed",
+            done=done,
+            prompt_preview=prompt_output[:80],
+        )
         return (prompt_output,)
 
 
-class ImageRouter:
-    """Persist images and notify the director front-end."""
+class ImageRouterSink:
+    """Persist images, update the latest pointer, and notify the front-end."""
 
     CATEGORY = "Director/IO"
+    OUTPUT_NODE = True
     RETURN_TYPES = ()
     RETURN_NAMES = ()
     FUNCTION = "execute"
@@ -300,51 +337,159 @@ class ImageRouter:
                 "image": ("IMAGE",),
                 "link_id": ("STRING", {"default": ""}),
                 "persist_dir": ("STRING", {"default": "./director_actor"}),
-                "iter_tag": ("INT", {"default": 0, "min": 0}),
+                "iter": ("INT", {"default": 0, "min": 0}),
             }
         }
 
     @staticmethod
-    def _notify(link_id: str, path: Path, iteration: int) -> None:
+    def _notify(link_id: str, iteration_path: Path, latest_path: Path, iteration: int) -> None:
         if not link_id:
             return
-        payload = {"link_id": link_id, "path": str(path), "iter": iteration}
+        payload = {
+            "link_id": link_id,
+            "path": str(iteration_path),
+            "iter": iteration,
+            "latest": str(latest_path),
+        }
         try:
             PromptServer.instance.send_sync("img-ready", payload)
         except Exception:
+            # Notification failures should not interrupt execution.
             pass
+
+    @staticmethod
+    def _atomic_update_latest(image: Image.Image, latest_path: Path) -> None:
+        latest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=".png", dir=str(latest_path.parent)
+            ) as handle:
+                tmp_path = Path(handle.name)
+                image.save(handle, format="PNG")
+            os.replace(tmp_path, latest_path)
+        finally:
+            if tmp_path and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def execute(
         self,
         image: torch.Tensor,
         link_id: str,
         persist_dir: str,
-        iter_tag: int,
+        iter: int,
     ) -> Tuple[()]:
         pil_images = _tensor_to_pil_list(image)
         if not pil_images:
-            raise ValueError("ImageRouter received an empty image tensor.")
+            raise ValueError("ImageRouterSink received an empty image tensor.")
 
-        base_path = Path(os.path.expanduser(persist_dir))
+        base_path = Path(os.path.expanduser(persist_dir)).resolve()
         if link_id:
             base_path = base_path / link_id
         base_path.mkdir(parents=True, exist_ok=True)
 
-        filename = f"iter_{int(iter_tag):04d}.png"
-        target_path = base_path / filename
-        pil_images[0].save(target_path, format="PNG")
+        filename = f"iter_{int(iter):04d}.png"
+        iteration_path = base_path / filename
+        pil_images[0].save(iteration_path, format="PNG")
 
-        self._notify(link_id, target_path.resolve(), int(iter_tag))
+        latest_path = base_path / "latest.png"
+        self._atomic_update_latest(pil_images[0], latest_path)
+
+        self._notify(link_id, iteration_path.resolve(), latest_path.resolve(), int(iter))
         return tuple()
+
+
+class LatestImageSource:
+    """Load the most recent actor image as a tensor."""
+
+    CATEGORY = "Director/IO"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "load"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latest_path": (
+                    "STRING",
+                    {"default": "${persist_dir}/${link_id}/latest.png"},
+                ),
+                "persist_dir": ("STRING", {"default": "./director_actor"}),
+                "link_id": ("STRING", {"default": ""}),
+            }
+        }
+
+    @staticmethod
+    def _resolve_path(latest_path: str, persist_dir: str, link_id: str) -> Path:
+        persist_root = Path(os.path.expanduser(persist_dir)).resolve()
+        group_dir = persist_root / link_id if link_id else persist_root
+
+        candidate = (latest_path or "").strip()
+        if candidate:
+            candidate = candidate.replace("${persist_dir}", str(persist_root))
+            candidate = candidate.replace("${link_id}", link_id)
+            resolved = Path(os.path.expanduser(candidate))
+            if not resolved.is_absolute():
+                base = group_dir if link_id else persist_root
+                resolved = base.joinpath(resolved).resolve()
+            else:
+                resolved = resolved.resolve()
+        else:
+            resolved = (group_dir / "latest.png").resolve()
+
+        return resolved
+
+    @staticmethod
+    def _load_tensor_from_image(image_path: Path) -> torch.Tensor:
+        with Image.open(image_path) as handle:
+            rgb_image = handle.convert("RGB")
+            array = np.array(rgb_image, dtype=np.float32) / 255.0
+        tensor = torch.from_numpy(array)
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(-1)
+        tensor = tensor.unsqueeze(0)
+        return tensor
+
+    @classmethod
+    def IS_CHANGED(
+        cls,
+        latest_path: str,
+        persist_dir: str,
+        link_id: str,
+    ) -> str:
+        resolved = cls._resolve_path(latest_path, persist_dir, link_id)
+        try:
+            stat = resolved.stat()
+        except FileNotFoundError:
+            return "missing"
+        return f"{resolved}:{stat.st_mtime_ns}:{stat.st_size}"
+
+    def load(
+        self,
+        latest_path: str,
+        persist_dir: str,
+        link_id: str,
+    ) -> Tuple[torch.Tensor]:
+        resolved = self._resolve_path(latest_path, persist_dir, link_id)
+        if not resolved.exists():
+            return (torch.zeros((0,), dtype=torch.float32),)
+        tensor = self._load_tensor_from_image(resolved)
+        return (tensor,)
 
 
 NODE_CLASS_MAPPINGS = {
     "DirectorGemini": DirectorGemini,
-    "ImageRouter": ImageRouter,
+    "ImageRouterSink": ImageRouterSink,
+    "LatestImageSource": LatestImageSource,
 }
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DirectorGemini": "Director (Gemini, single prompt)",
-    "ImageRouter": "Image Router (persist + notify)",
+    "ImageRouterSink": "Image Router Sink (persist + latest)",
+    "LatestImageSource": "Latest Image Source",
 }
