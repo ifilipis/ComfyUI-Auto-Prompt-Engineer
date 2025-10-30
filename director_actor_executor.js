@@ -72,6 +72,15 @@ function ensureNumber(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function ensureInteger(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  const truncated = Math.trunc(parsed);
+  return Number.isFinite(truncated) ? truncated : fallback;
+}
+
 function updateTargetIds(ids) {
   daeState.targetIds.clear();
   ids.forEach((id) => daeState.targetIds.add(id));
@@ -111,8 +120,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
   }
 
   setMaxLoops(value) {
-    const numeric = Number(value);
-    const sanitized = Math.max(1, Number.isFinite(numeric) ? Math.floor(numeric) : 1);
+    const sanitized = Math.max(1, ensureInteger(value, 1));
     this.properties.maxLoops = sanitized;
     if (this.maxLoopsWidget) {
       this.maxLoopsWidget.value = sanitized;
@@ -168,12 +176,11 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
   }
 
   async executeLoop() {
-    const maxLoops = Math.max(1, ensureNumber(this.properties.maxLoops, 1));
+    const maxLoops = Math.max(1, ensureInteger(this.properties.maxLoops, 1));
     let iteration = 0;
 
     while (!this.properties.isCancelling && iteration < maxLoops) {
       this.lastDirectorStatus = null;
-      const statusWait = this.waitForDirectorSignal();
       debugLog("Queueing director group", { iteration });
       this.updateStatus(`Director pass ${iteration + 1}`);
       await this.queueGroupAndWait(this.properties.directorGroupName);
@@ -181,9 +188,11 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
         break;
       }
 
-      const directorStatus = (await statusWait) || { done: false, prompt: "" };
-      debugLog("Director status received", directorStatus);
-      const actorDecision = this.evaluateDirectorStatus(directorStatus, iteration);
+      debugLog("Awaiting director status", { iteration });
+      const directorStatus = await this.waitForDirectorSignal(undefined, iteration);
+      const resolvedStatus = directorStatus || this.lastDirectorStatus || { done: false, prompt: "" };
+      debugLog("Director status received", resolvedStatus);
+      const actorDecision = this.evaluateDirectorStatus(resolvedStatus, iteration);
       if (!actorDecision.runActor) {
         this.properties.iter = iteration + 1;
         this.updateStatus(actorDecision.statusText);
@@ -217,14 +226,14 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     });
   }
 
-  async waitForDirectorSignal(timeoutMs = 10000) {
+  async waitForDirectorSignal(timeoutMs = 60000, iteration = null) {
     const start = Date.now();
     while (!this.properties.isCancelling) {
       if (this.lastDirectorStatus) {
         return this.lastDirectorStatus;
       }
-      if (Date.now() - start >= timeoutMs) {
-        debugLog("Director status wait timed out", { timeoutMs });
+      if (timeoutMs != null && Date.now() - start >= timeoutMs) {
+        debugLog("Director status wait timed out", { timeoutMs, iteration });
         return this.lastDirectorStatus;
       }
       await sleep(50);

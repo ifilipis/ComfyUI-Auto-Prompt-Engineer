@@ -225,10 +225,12 @@ class DirectorGemini:
                 "initial_image": ("IMAGE",),
                 "model": ("STRING", {"default": "gemini-1.5-pro"}),
                 "api_key": ("STRING", {"default": ""}),
-                "link_id": ("STRING", {"default": ""}),
             },
             "optional": {
                 "latest_image": ("IMAGE",),
+            },
+            "hidden": {
+                "link_id": ("STRING", {"default": ""}),
             },
         }
 
@@ -508,8 +510,10 @@ class ImageRouterSink:
         return {
             "required": {
                 "image": ("IMAGE",),
+            },
+            "hidden": {
                 "link_id": ("STRING", {"default": ""}),
-            }
+            },
         }
 
     @staticmethod
@@ -613,7 +617,8 @@ class LatestImageSource:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
+            "required": {},
+            "hidden": {
                 "link_id": ("STRING", {"default": ""}),
             }
         }
