@@ -26,3 +26,5 @@ You are creating a custom ComfyUI node. You must update this document with issue
 - Reset executor link IDs on Run to start fresh sessions and mirror the new debug outputs.
 - Clamp executor loop counts to integers and log the wait for director status before each actor pass.
 - Ensure manual queue fallbacks coalesce their targets per phase before dispatching to avoid duplicate runs.
+- Add optional system instruction overrides to the DirectorGemini node.
+- Add a force analyze control that reuses the active session, clears SUCCESS history entries, and reruns the review loop.

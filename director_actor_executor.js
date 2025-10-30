@@ -15,6 +15,8 @@ daeState.phaseTargetIds = daeState.phaseTargetIds || new Set();
 daeState.phaseTargetSummary = daeState.phaseTargetSummary || [];
 daeState.directorOutputId = daeState.directorOutputId || null;
 daeState.stopOnSuccess = daeState.stopOnSuccess || false;
+daeState.forceAnalyze = daeState.forceAnalyze || false;
+daeState.forceAnalyzeFeedback = daeState.forceAnalyzeFeedback || "";
 
 defineInterruptHooks();
 
@@ -256,6 +258,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     this.setMaxLoops(this.properties.maxLoops);
     this.addWidget("button", "Run", null, () => this.startExecution());
     this.addWidget("button", "Cancel", null, () => this.cancelExecution());
+    this.addWidget("button", "Force Analyze", null, () => this.forceAnalyze());
   }
 
   setMaxLoops(value) {
@@ -286,23 +289,39 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     ctx.restore();
   }
 
-  async startExecution() {
+  async startExecution(options = {}) {
     if (this.properties.isExecuting) {
       return;
     }
+
+    const reuseLink = Boolean(options.reuseLink);
+    const forceAnalyze = Boolean(options.forceAnalyze);
+    const forceFeedback =
+      typeof options.forceFeedback === "string" ? options.forceFeedback : "";
 
     clearPhaseContext();
     daeState.stopOnSuccess = false;
     this.stopGateEngaged = false;
 
-    this.resetSessionLink();
-    debugLog("Run requested", { linkId: this.properties.linkId });
+    if (forceAnalyze) {
+      this.ensureLinkId();
+      debugLog("Force analyze requested", { linkId: this.properties.linkId });
+    } else if (reuseLink) {
+      this.ensureLinkId();
+      debugLog("Run requested with reused link", { linkId: this.properties.linkId });
+    } else {
+      this.resetSessionLink();
+      debugLog("Run requested", { linkId: this.properties.linkId });
+    }
 
     this.properties.isExecuting = true;
     this.properties.isCancelling = false;
     this.properties.iter = 0;
     this.lastDirectorStatus = null;
-    this.updateStatus("Starting loop");
+    this.forceAnalyzeActive = forceAnalyze;
+    daeState.forceAnalyze = forceAnalyze;
+    daeState.forceAnalyzeFeedback = forceAnalyze ? forceFeedback : "";
+    this.updateStatus(forceAnalyze ? "Force analyze" : "Starting loop");
     daeState.executors.add(this);
     daeState.activeCount += 1;
     daeState.active = true;
@@ -316,6 +335,19 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     } finally {
       this.cleanupAfterExecution();
     }
+  }
+
+  async forceAnalyze() {
+    if (this.properties.isExecuting) {
+      return;
+    }
+
+    if (!this.properties.linkId) {
+      debugLog("Force analyze requested without active link", {});
+      return;
+    }
+
+    await this.startExecution({ reuseLink: true, forceAnalyze: true });
   }
 
   async executeLoop() {
@@ -693,6 +725,8 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     this.detachEventListeners();
     clearPhaseContext();
     daeState.stopOnSuccess = false;
+    daeState.forceAnalyze = false;
+    daeState.forceAnalyzeFeedback = "";
     this.stopGateEngaged = false;
     daeState.executors.delete(this);
     daeState.activeCount = Math.max(0, daeState.activeCount - 1);
@@ -703,6 +737,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     if (daeState.currentLinkId === this.properties.linkId) {
       daeState.currentLinkId = null;
     }
+    this.forceAnalyzeActive = false;
     this.properties.isExecuting = false;
     this.properties.isCancelling = false;
     this.updateStatus("Idle");
