@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -142,20 +143,6 @@ class DirectorGemini:
                 "latest_image": ("IMAGE",),
             },
         }
-
-    @classmethod
-    def IS_CHANGED(
-        cls,
-        instruction: str,
-        initial_image: torch.Tensor,
-        model: str,
-        api_key: str,
-        history_json: str,
-        link_id: str,
-        latest_image: Optional[torch.Tensor] = None,
-    ) -> float:
-        # Force ComfyUI to treat the node as changed every pass so the director reruns.
-        return float("nan")
 
     @staticmethod
     def _build_expand_contents(
@@ -334,8 +321,8 @@ class DirectorGemini:
         return (prompt_output,)
 
 
-class ImageRouter:
-    """Persist images and notify the director front-end."""
+class ImageRouterSink:
+    """Persist images, update the latest pointer, and notify the front-end."""
 
     CATEGORY = "Director/IO"
     RETURN_TYPES = ()
@@ -349,51 +336,159 @@ class ImageRouter:
                 "image": ("IMAGE",),
                 "link_id": ("STRING", {"default": ""}),
                 "persist_dir": ("STRING", {"default": "./director_actor"}),
-                "iter_tag": ("INT", {"default": 0, "min": 0}),
+                "iter": ("INT", {"default": 0, "min": 0}),
             }
         }
 
     @staticmethod
-    def _notify(link_id: str, path: Path, iteration: int) -> None:
+    def _notify(link_id: str, iteration_path: Path, latest_path: Path, iteration: int) -> None:
         if not link_id:
             return
-        payload = {"link_id": link_id, "path": str(path), "iter": iteration}
+        payload = {
+            "link_id": link_id,
+            "path": str(iteration_path),
+            "iter": iteration,
+            "latest": str(latest_path),
+        }
         try:
             PromptServer.instance.send_sync("img-ready", payload)
         except Exception:
+            # Notification failures should not interrupt execution.
             pass
+
+    @staticmethod
+    def _atomic_update_latest(image: Image.Image, latest_path: Path) -> None:
+        latest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=".png", dir=str(latest_path.parent)
+            ) as handle:
+                tmp_path = Path(handle.name)
+                image.save(handle, format="PNG")
+            os.replace(tmp_path, latest_path)
+        finally:
+            if tmp_path and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def execute(
         self,
         image: torch.Tensor,
         link_id: str,
         persist_dir: str,
-        iter_tag: int,
+        iter: int,
     ) -> Tuple[()]:
         pil_images = _tensor_to_pil_list(image)
         if not pil_images:
-            raise ValueError("ImageRouter received an empty image tensor.")
+            raise ValueError("ImageRouterSink received an empty image tensor.")
 
-        base_path = Path(os.path.expanduser(persist_dir))
+        base_path = Path(os.path.expanduser(persist_dir)).resolve()
         if link_id:
             base_path = base_path / link_id
         base_path.mkdir(parents=True, exist_ok=True)
 
-        filename = f"iter_{int(iter_tag):04d}.png"
-        target_path = base_path / filename
-        pil_images[0].save(target_path, format="PNG")
+        filename = f"iter_{int(iter):04d}.png"
+        iteration_path = base_path / filename
+        pil_images[0].save(iteration_path, format="PNG")
 
-        self._notify(link_id, target_path.resolve(), int(iter_tag))
+        latest_path = base_path / "latest.png"
+        self._atomic_update_latest(pil_images[0], latest_path)
+
+        self._notify(link_id, iteration_path.resolve(), latest_path.resolve(), int(iter))
         return tuple()
+
+
+class LatestImageSource:
+    """Load the most recent actor image as a tensor."""
+
+    CATEGORY = "Director/IO"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "load"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latest_path": (
+                    "STRING",
+                    {"default": "${persist_dir}/${link_id}/latest.png"},
+                ),
+                "persist_dir": ("STRING", {"default": "./director_actor"}),
+                "link_id": ("STRING", {"default": ""}),
+            }
+        }
+
+    @staticmethod
+    def _resolve_path(latest_path: str, persist_dir: str, link_id: str) -> Path:
+        persist_root = Path(os.path.expanduser(persist_dir)).resolve()
+        group_dir = persist_root / link_id if link_id else persist_root
+
+        candidate = (latest_path or "").strip()
+        if candidate:
+            candidate = candidate.replace("${persist_dir}", str(persist_root))
+            candidate = candidate.replace("${link_id}", link_id)
+            resolved = Path(os.path.expanduser(candidate))
+            if not resolved.is_absolute():
+                base = group_dir if link_id else persist_root
+                resolved = base.joinpath(resolved).resolve()
+            else:
+                resolved = resolved.resolve()
+        else:
+            resolved = (group_dir / "latest.png").resolve()
+
+        return resolved
+
+    @staticmethod
+    def _load_tensor_from_image(image_path: Path) -> torch.Tensor:
+        with Image.open(image_path) as handle:
+            rgb_image = handle.convert("RGB")
+            array = np.array(rgb_image, dtype=np.float32) / 255.0
+        tensor = torch.from_numpy(array)
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(-1)
+        tensor = tensor.unsqueeze(0)
+        return tensor
+
+    @classmethod
+    def IS_CHANGED(
+        cls,
+        latest_path: str,
+        persist_dir: str,
+        link_id: str,
+    ) -> str:
+        resolved = cls._resolve_path(latest_path, persist_dir, link_id)
+        try:
+            stat = resolved.stat()
+        except FileNotFoundError:
+            return "missing"
+        return f"{resolved}:{stat.st_mtime_ns}:{stat.st_size}"
+
+    def load(
+        self,
+        latest_path: str,
+        persist_dir: str,
+        link_id: str,
+    ) -> Tuple[torch.Tensor]:
+        resolved = self._resolve_path(latest_path, persist_dir, link_id)
+        if not resolved.exists():
+            return (torch.zeros((0,), dtype=torch.float32),)
+        tensor = self._load_tensor_from_image(resolved)
+        return (tensor,)
 
 
 NODE_CLASS_MAPPINGS = {
     "DirectorGemini": DirectorGemini,
-    "ImageRouter": ImageRouter,
+    "ImageRouterSink": ImageRouterSink,
+    "LatestImageSource": LatestImageSource,
 }
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DirectorGemini": "Director (Gemini, single prompt)",
-    "ImageRouter": "Image Router (persist + notify)",
+    "ImageRouterSink": "Image Router Sink (persist + latest)",
+    "LatestImageSource": "Latest Image Source",
 }
