@@ -1,6 +1,7 @@
 const daeState = window.__DAE_state || (window.__DAE_state = {});
 
 daeState.targetIds = daeState.targetIds || new Set();
+daeState.currentLinkId = daeState.currentLinkId || null;
 
 function normalizeNodeId(nodeId) {
   return nodeId != null ? String(nodeId) : "";
@@ -74,6 +75,25 @@ export function buildFilteredPrompt(originalBody, targetIdsIterable) {
       filtered[id] = promptGraph[id];
     }
   });
+
+  const linkId = daeState.currentLinkId;
+  if (linkId) {
+    Object.values(filtered).forEach((nodeData) => {
+      if (!nodeData || typeof nodeData !== "object") {
+        return;
+      }
+      if (!nodeData.inputs || typeof nodeData.inputs !== "object") {
+        nodeData.inputs = nodeData.inputs ? { ...nodeData.inputs } : {};
+      }
+      if (
+        nodeData.class_type === "DirectorGemini" ||
+        nodeData.class_type === "ImageRouterSink" ||
+        nodeData.class_type === "LatestImageSource"
+      ) {
+        nodeData.inputs.link_id = linkId;
+      }
+    });
+  }
 
   body.prompt = filtered;
   return body;

@@ -8,6 +8,7 @@ daeState.targetIds = daeState.targetIds || new Set();
 daeState.executors = daeState.executors || new Set();
 daeState.activeCount = daeState.activeCount || 0;
 daeState.active = daeState.active || false;
+daeState.currentLinkId = daeState.currentLinkId || null;
 
 defineInterruptHooks();
 
@@ -120,6 +121,8 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       return;
     }
 
+    this.ensureLinkId();
+
     this.properties.isExecuting = true;
     this.properties.isCancelling = false;
     this.properties.iter = 0;
@@ -184,6 +187,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       throw new Error(`No output nodes found in group "${groupName}"`);
     }
 
+    daeState.currentLinkId = this.ensureLinkId();
     const nodeIds = outputNodes.map((node) => node.id);
     updateTargetIds(nodeIds);
 
@@ -241,6 +245,13 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       }
       await sleep(200);
     }
+  }
+
+  ensureLinkId() {
+    if (!this.properties.linkId) {
+      this.properties.linkId = generateLinkId();
+    }
+    return this.properties.linkId;
   }
 
   getGroupOutputNodes(groupName) {
@@ -350,6 +361,9 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     if (daeState.activeCount === 0) {
       daeState.active = false;
       daeState.targetIds.clear();
+    }
+    if (daeState.currentLinkId === this.properties.linkId) {
+      daeState.currentLinkId = null;
     }
     this.properties.isExecuting = false;
     this.properties.isCancelling = false;
