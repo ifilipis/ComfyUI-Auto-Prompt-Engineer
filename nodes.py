@@ -433,7 +433,12 @@ class DirectorGemini:
                 session_id,
                 include_latest=latest_pil is None,
             )
-            _debug_log("Resolved mode", mode=mode, history_entries=len(history))
+            _debug_log(
+                "Resolved mode",
+                mode=mode,
+                history_entries=len(history),
+                session_id=session_id,
+            )
 
             if mode == "expand":
                 contents, system_instruction = self._build_expand_contents(
@@ -479,6 +484,7 @@ class DirectorGemini:
             "Execute completed",
             done=done,
             prompt_preview=prompt_output[:80],
+            event_prompt_preview=event_prompt[:80],
         )
         return (prompt_output,)
 
