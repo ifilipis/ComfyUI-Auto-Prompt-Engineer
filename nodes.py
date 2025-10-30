@@ -1,43 +1,35 @@
 import base64
 import io
 import json
-from typing import Any, Dict, List, Tuple
+import os
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import torch
 import numpy as np
+import torch
 from PIL import Image
 
-# --- Gemini API Setup and Helpers ---
+from server import PromptServer
 
-# Attempt to import the modern Google Generative AI library.
 try:
     import google.generativeai as genai
-except ImportError:
-    raise ImportError("The 'google-generativeai' package is required. Please install it by running 'pip install google-generativeai'.")
+except ImportError as exc:  # pragma: no cover - import guard
+    raise ImportError(
+        "The 'google-generativeai' package is required. Please install it by running 'pip install google-generativeai'."
+    ) from exc
 
-# --- Custom Helper Function for Tensor to PIL Conversion ---
 
 def tensor_to_pil(tensor: torch.Tensor) -> List[Image.Image]:
-    """
-    Converts a ComfyUI IMAGE tensor (N, H, W, C) in the range [0, 1]
-    to a list of PIL Images.
-    """
+    """Converts a ComfyUI IMAGE tensor (N, H, W, C) in the range [0, 1] to a list of PIL images."""
     if not isinstance(tensor, torch.Tensor):
         return []
 
-    images = []
+    images: List[Image.Image] = []
     for img_tensor in tensor:
-        # Clamp the values to be safe
         img_tensor = torch.clamp(img_tensor, 0.0, 1.0)
-        # Convert to numpy array, scale to 0-255, and change type to uint8
         image_np = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
-        # Create PIL Image from array
-        pil_image = Image.fromarray(image_np)
-        images.append(pil_image)
+        images.append(Image.fromarray(image_np))
     return images
 
-
-# --- System Instructions for the Gemini Model ---
 
 _EXPAND_SYSTEM_INSTRUCTION = """You are an expert prompt engineer for a state-of-the-art image editing model. Your task is to take a user's simple instruction and a set of input images, and expand the instruction into a detailed, descriptive prompt that will guide the image model to produce a high-quality edited result.
 
@@ -74,56 +66,264 @@ Your output must be a new, updated prompt for the image generation model. This p
 
 
 def _pil_to_inline_image(pil_image: Image.Image) -> Dict[str, Any]:
-    """Converts a PIL Image to a Gemini API inline_data dictionary."""
     buffer = io.BytesIO()
     pil_image.save(buffer, format="PNG")
-    b64_data = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    return {"inline_data": {"mime_type": "image/png", "data": b64_data}}
+    data = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return {"inline_data": {"mime_type": "image/png", "data": data}}
 
 
 def _safe_json_loads(text: str) -> List[Dict[str, Any]]:
-    """Safely loads a JSON string into a list of dictionaries, returning an empty list on failure."""
     if not text:
         return []
     try:
         data = json.loads(text)
-        if isinstance(data, list):
-            return [item for item in data if isinstance(item, dict)]
     except json.JSONDecodeError:
         return []
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
     return []
 
 
 def _extract_text(response: Any) -> str:
-    """Extracts text content from a Gemini API response."""
     if not response:
         return ""
     try:
-        return response.text
+        return response.text or ""
     except AttributeError:
         return ""
 
 
 def _call_gemini(api_key: str, model_name: str, contents: List[Dict[str, Any]], system_instruction: str) -> str:
-    """Calls the Gemini API with the provided content and system instruction."""
-    if not api_key:
-        raise ValueError("Gemini API key is missing.")
-    genai.configure(api_key=api_key)
-    
+    if api_key:
+        genai.configure(api_key=api_key)
+    else:
+        genai.configure()
+
     model = genai.GenerativeModel(
         model_name=model_name,
-        system_instruction=system_instruction
+        system_instruction=system_instruction,
     )
-    
+
     generation_config = genai.types.GenerationConfig(temperature=0.7)
-    
     response = model.generate_content(contents, generation_config=generation_config)
-    
     return _extract_text(response)
 
 
+def _collect_history_parts(history: Iterable[Dict[str, Any]]):
+    for step in history:
+        if not isinstance(step, dict):
+            continue
+        image_b64 = step.get("image") or step.get("output") or step.get("initial") or step.get("input")
+        if isinstance(image_b64, str) and image_b64:
+            yield "image", image_b64
+        analysis = step.get("analysisText") or step.get("analysis")
+        if isinstance(analysis, str) and analysis:
+            yield "text", analysis
+
+
+def _emit_director_status(link_id: str, done: bool, prompt_text: str) -> None:
+    if not link_id:
+        return
+    try:
+        PromptServer.instance.send_sync(
+            "director-status",
+            {"link_id": link_id, "done": done, "prompt": prompt_text},
+        )
+    except Exception:
+        pass
+
+
+class DirectorGemini:
+    CATEGORY = "Director/Gemini"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "execute"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "instruction": ("STRING", {"default": "", "multiline": True}),
+                "initial_image": ("IMAGE",),
+                "model": ("STRING", {"default": "gemini-1.5-pro-latest"}),
+                "api_key": ("STRING", {"default": ""}),
+                "history_json": ("STRING", {"default": "[]", "multiline": True}),
+                "link_id": ("STRING", {"default": ""}),
+            },
+            "optional": {
+                "latest_image": ("IMAGE",),
+            },
+        }
+
+    @staticmethod
+    def _build_expand_contents(instruction: str, initial_image: Image.Image) -> Tuple[List[Dict[str, Any]], str]:
+        contents = [
+            {
+                "role": "user",
+                "parts": [
+                    _pil_to_inline_image(initial_image),
+                    {"text": instruction},
+                ],
+            }
+        ]
+        return contents, _EXPAND_SYSTEM_INSTRUCTION
+
+    @staticmethod
+    def _build_review_contents(
+        instruction: str,
+        initial_image: Image.Image,
+        latest_image: Optional[Image.Image],
+        history: Iterable[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        contents: List[Dict[str, Any]] = [
+            {
+                "role": "user",
+                "parts": [
+                    _pil_to_inline_image(initial_image),
+                    {"text": f'My instruction is: "{instruction}"'},
+                ],
+            }
+        ]
+
+        for kind, value in _collect_history_parts(history):
+            if kind == "image":
+                contents.append(
+                    {
+                        "role": "model",
+                        "parts": [
+                            {"inline_data": {"mime_type": "image/png", "data": value}},
+                        ],
+                    }
+                )
+            else:
+                contents.append({"role": "model", "parts": [{"text": value}]})
+
+        if latest_image is not None:
+            contents.append({"role": "model", "parts": [_pil_to_inline_image(latest_image)]})
+
+        final_text = (
+            "Look at the image and analyze if you failed to follow the instruction. "
+            "If you succeeded respond with SUCCESS. If not, return the corrected prompt."
+        )
+        contents.append({"role": "user", "parts": [{"text": final_text}]})
+        return contents, _REVIEW_SYSTEM_INSTRUCTION
+
+    def execute(
+        self,
+        instruction: str,
+        initial_image: torch.Tensor,
+        model: str,
+        api_key: str,
+        history_json: str,
+        link_id: str,
+        latest_image: Optional[torch.Tensor] = None,
+    ) -> Tuple[str]:
+        prompt_text = ""
+        history = _safe_json_loads(history_json)
+
+        print("[DirectorGemini] Starting execution", {
+            "instruction": instruction,
+            "link_id": link_id,
+        })
+
+        try:
+            initial_pil_list = tensor_to_pil(initial_image)
+            if not initial_pil_list:
+                raise ValueError("Initial image tensor is empty.")
+            initial_pil = initial_pil_list[0]
+
+            latest_pil: Optional[Image.Image] = None
+            if isinstance(latest_image, torch.Tensor):
+                latest_list = tensor_to_pil(latest_image)
+                if latest_list:
+                    latest_pil = latest_list[0]
+
+            is_review = latest_pil is not None
+            print("[DirectorGemini] Mode determined", {
+                "mode": "review" if is_review else "expand",
+                "has_history": bool(history),
+            })
+            if is_review:
+                contents, system_instruction = self._build_review_contents(
+                    instruction,
+                    initial_pil,
+                    latest_pil,
+                    history,
+                )
+            else:
+                contents, system_instruction = self._build_expand_contents(instruction, initial_pil)
+
+            response_text = _call_gemini(api_key, model, contents, system_instruction).strip()
+            if not response_text:
+                response_text = instruction.strip()
+
+            if is_review:
+                if response_text.upper() == "SUCCESS":
+                    prompt_text = "SUCCESS"
+                    _emit_director_status(link_id, True, "")
+                    print("[DirectorGemini] Review marked SUCCESS", {"link_id": link_id})
+                else:
+                    prompt_text = response_text
+                    _emit_director_status(link_id, False, prompt_text)
+                    print("[DirectorGemini] Review generated prompt", {"prompt": prompt_text})
+            else:
+                prompt_text = response_text
+                _emit_director_status(link_id, False, prompt_text)
+                print("[DirectorGemini] Expand generated prompt", {"prompt": prompt_text})
+        except Exception as exc:  # pragma: no cover - runtime diagnostics
+            prompt_text = f"<director_error:{exc}>"
+            _emit_director_status(link_id, True, prompt_text)
+            print("[DirectorGemini] Error", {"error": prompt_text})
+
+        return (prompt_text,)
+
+
+class ImageRouter:
+    CATEGORY = "Director/IO"
+    RETURN_TYPES: Tuple = ()
+    RETURN_NAMES: Tuple = ()
+    FUNCTION = "execute"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "link_id": ("STRING", {"default": ""}),
+                "persist_dir": ("STRING", {"default": "."}),
+                "iter_tag": ("INT", {"default": 0, "min": 0}),
+            }
+        }
+
+    def execute(self, image: torch.Tensor, link_id: str, persist_dir: str, iter_tag: int) -> Tuple[()]:
+        print("[ImageRouter] Received image", {"link_id": link_id, "iter": iter_tag})
+        pil_images = tensor_to_pil(image)
+        if not pil_images:
+            raise ValueError("ImageRouter received no image data.")
+
+        base_dir = persist_dir or "."
+        if link_id:
+            base_dir = os.path.join(base_dir, link_id)
+        os.makedirs(base_dir, exist_ok=True)
+
+        filename = f"iter_{iter_tag:04d}.png"
+        path = os.path.abspath(os.path.join(base_dir, filename))
+        pil_images[0].save(path, format="PNG")
+        print("[ImageRouter] Saved image", {"path": path})
+
+        try:
+            PromptServer.instance.send_sync(
+                "img-ready",
+                {"link_id": link_id, "path": path, "iter": int(iter_tag)},
+            )
+            print("[ImageRouter] Emitted img-ready", {"link_id": link_id, "iter": int(iter_tag)})
+        except Exception:
+            pass
+
+        return tuple()
+
+
 class GeminiDirector:
-    """A ComfyUI node that uses the Gemini API to direct image generation."""
     CATEGORY = "Director/Gemini"
     RETURN_TYPES = ("STRING", "BOOLEAN")
     RETURN_NAMES = ("prompt", "done")
@@ -147,8 +347,13 @@ class GeminiDirector:
         }
 
     @staticmethod
-    def _build_contents(mode: str, goal: str, current_image: Image.Image, history: List[Dict[str, Any]], feedback: str) -> Tuple[List[Dict[str, Any]], str]:
-        """Constructs the 'contents' list for the Gemini API call."""
+    def _build_contents(
+        mode: str,
+        goal: str,
+        current_image: Image.Image,
+        history: List[Dict[str, Any]],
+        feedback: str,
+    ) -> Tuple[List[Dict[str, Any]], str]:
         current_image_part = _pil_to_inline_image(current_image)
 
         if mode == "expand":
@@ -162,9 +367,9 @@ class GeminiDirector:
                 if isinstance(img_b64, str) and img_b64:
                     initial_image_b64 = img_b64
                     break
-        
+
         if not initial_image_b64:
-             initial_image_b64 = current_image_part["inline_data"]["data"]
+            initial_image_b64 = current_image_part["inline_data"]["data"]
 
         initial_image_part = {"inline_data": {"mime_type": "image/png", "data": initial_image_b64}}
         contents = [{"role": "user", "parts": [initial_image_part, {"text": f'My instruction is: "{goal}"'}]}]
@@ -174,7 +379,7 @@ class GeminiDirector:
             if isinstance(img_b64, str):
                 image_part = {"inline_data": {"mime_type": "image/png", "data": img_b64}}
                 contents.append({"role": "model", "parts": [image_part]})
-            
+
             analysis = step.get("analysisText")
             if isinstance(analysis, str):
                 contents.append({"role": "model", "parts": [{"text": analysis}]})
@@ -182,24 +387,41 @@ class GeminiDirector:
         contents.append({"role": "model", "parts": [current_image_part]})
 
         if mode == "review":
-            final_text = "Look at this latest image. Analyze if you have perfectly followed the instructions. If so, say SUCCESS. If not, provide an improved prompt."
+            final_text = (
+                "Look at this latest image. Analyze if you have perfectly followed the instructions. "
+                "If so, say SUCCESS. If not, provide an improved prompt."
+            )
             contents.append({"role": "user", "parts": [{"text": final_text}]})
             return contents, _REVIEW_SYSTEM_INSTRUCTION
-        
-        final_feedback = feedback.strip() or "The image still failed to meet the instructions. Re-analyze your work, find the flaw, and provide the detailed, first-person critique as instructed."
+
+        final_feedback = feedback.strip() or (
+            "The image still failed to meet the instructions. Re-analyze your work, find the flaw, "
+            "and provide the detailed, first-person critique as instructed."
+        )
         contents.append({"role": "user", "parts": [{"text": final_feedback}]})
         return contents, _FORCE_REVIEW_SYSTEM_INSTRUCTION
 
-    def execute(self, mode: str, goal: str, image: torch.Tensor, model: str, api_key: str, history_json: str, feedback: str = ""):
+    def execute(
+        self,
+        mode: str,
+        goal: str,
+        image: torch.Tensor,
+        model: str,
+        api_key: str,
+        history_json: str,
+        feedback: str = "",
+    ) -> Tuple[str, bool]:
         prompt = ""
         done = True
+
+        print("[GeminiDirector] Starting", {"mode": mode, "goal": goal[:30]})
 
         try:
             pil_images = tensor_to_pil(image)
             if not pil_images:
                 raise ValueError("Input tensor could not be converted to an image.")
             current_pil_image = pil_images[0]
-            
+
             history = _safe_json_loads(history_json)
             contents, system_instruction = self._build_contents(mode, goal, current_pil_image, history, feedback)
             response_text = _call_gemini(api_key, model, contents, system_instruction).strip()
@@ -207,20 +429,21 @@ class GeminiDirector:
             if mode == "review" and response_text.upper() == "SUCCESS":
                 prompt = ""
                 done = True
+                print("[GeminiDirector] Review SUCCESS", {})
             else:
                 prompt = response_text
                 done = not bool(prompt)
+                print("[GeminiDirector] Generated prompt", {"prompt": prompt})
 
-        except Exception as e:
-            prompt = f"<error> GeminiDirector failed: {e}"
+        except Exception as exc:
+            prompt = f"<error> GeminiDirector failed: {exc}"
             done = True
-            print(prompt)
+            print("[GeminiDirector] Error", {"error": prompt})
 
         return (prompt, done)
 
 
 class PromptSwitch:
-    """A utility node to switch between an initial prompt and subsequent prompts."""
     CATEGORY = "Director/Gemini"
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("current_prompt",)
@@ -236,19 +459,22 @@ class PromptSwitch:
             }
         }
 
-    def execute(self, iteration: int, first_prompt: str, next_prompt: str):
+    def execute(self, iteration: int, first_prompt: str, next_prompt: str) -> Tuple[str]:
         current_prompt = first_prompt if iteration == 0 else next_prompt
+        print("[PromptSwitch] Selected prompt", {"iteration": iteration})
         return (current_prompt,)
 
-
-# --- Node Mappings for ComfyUI ---
 
 NODE_CLASS_MAPPINGS = {
     "GeminiDirector": GeminiDirector,
     "PromptSwitch": PromptSwitch,
+    "DirectorGemini": DirectorGemini,
+    "ImageRouter": ImageRouter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "GeminiDirector": "Gemini Director",
     "PromptSwitch": "Prompt Switch",
+    "DirectorGemini": "Director (Gemini, single prompt)",
+    "ImageRouter": "Image Router (persist + notify)",
 }
