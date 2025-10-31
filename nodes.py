@@ -52,6 +52,25 @@ If you have perfectly followed the instruction, respond with only the word 'SUCC
 
 If you have failed, you must change your strategy. DO NOT repeat the same prompt. Your output must be an updated prompt that points out the previous failure and suggests a corrective action. Do not add conversational text or formatting—your output must be a PROMPT ONLY."""
 
+_FORCE_REVIEW_SYSTEM_INSTRUCTION = """You are a self-critical, multimodal AI assistant. You previously generated an image that you may have thought was correct, but the user was unsatisfied and has forced you to re-evaluate your work. Your task is to find the flaws in your last generated image.
+
+1. **Critically re-examine** your last generated image against the original user instruction and the entire conversation history. If the user provides specific feedback on the failure, you MUST prioritize addressing it in your analysis.
+2. You **MUST** find a flaw. Do not determine that you were successful.
+3. Write a detailed, humble, and self-critical analysis in the first person explaining what you could have done better or what you misinterpreted. Start by acknowledging the user's dissatisfaction (e.g., "The image is still..."). Your analysis itself will be used as the next prompt. Do NOT add any other conversational text or formatting.
+4. **You have failed**, it means that the previous prompts did not work, and you must change your strategy. DO NOT repeat the same prompt and reasoning. Do NOT add any other conversational text or formatting.
+At the end of your analysis, you must write an updated prompt, pointing out elements that have failed and corrective action.
+Keep analysis in the thinking channel. DO NOT output analysis directly. Your output must be a PROMPT ONLY.
+
+Focus on describing the necessary changes based on the user's instruction while considering the content of the original image. Your prompt must include:
+(!) **Always** describe small, specific, targeted edits that will move you to the desired result.
+- Visual Style: Match the existing style (e.g., photorealistic, oil painting).
+- Composition & Framing: Describe changes in relation to the existing composition.
+- Camera: Describe camera parameters and image style.
+- Lighting: Describe how lighting should be altered or added, matching the existing light source.
+- Details & Texture: Mention specific details from the original image that should be changed.
+- Action: Clearly describe the edit to be performed on the image.
+- Resulting image: Describe what the result will look like."""
+
 
 _PERSIST_DIR = os.environ.get("DIRECTOR_ACTOR_PERSIST_DIR", "./director_actor")
 _HISTORY_FILENAME = "history.json"
@@ -228,9 +247,23 @@ class DirectorGemini:
             },
             "optional": {
                 "latest_image": ("IMAGE",),
+                "expand_system_instruction": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
+                "review_system_instruction": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
+                "force_review_system_instruction": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
             },
             "hidden": {
                 "link_id": ("STRING", {"default": ""}),
+                "force_analyze": ("BOOLEAN", {"default": False}),
+                "force_feedback": ("STRING", {"default": ""}),
             },
         }
 
@@ -282,6 +315,8 @@ class DirectorGemini:
         initial: Image.Image,
         latest: Optional[Image.Image],
         history: Iterable[Dict[str, Any]],
+        force_analyze: bool = False,
+        feedback: str = "",
     ) -> Tuple[List[Dict[str, Any]], str]:
         contents: List[Dict[str, Any]] = [
             {
@@ -297,6 +332,21 @@ class DirectorGemini:
 
         if latest is not None:
             contents.append({"role": "model", "parts": [_pil_to_inline_image(latest)]})
+
+        if force_analyze:
+            prompt_text = feedback.strip()
+            if prompt_text:
+                prompt_text = (
+                    f"{prompt_text}. Re-analyze your work, find the flaw, and provide the detailed, "
+                    "first-person critique as instructed."
+                )
+            else:
+                prompt_text = (
+                    "The image still failed to meet the instructions. Re-analyze your work, find the flaw, "
+                    "and provide the detailed, first-person critique as instructed."
+                )
+            contents.append({"role": "user", "parts": [{"text": prompt_text}]})
+            return contents, _FORCE_REVIEW_SYSTEM_INSTRUCTION
 
         contents.append(
             {
@@ -395,6 +445,43 @@ class DirectorGemini:
         entries[latest_index] = latest
         _save_history_entries(group_dir, entries)
 
+    def _clear_latest_success_entry(
+        self,
+        group_dir: Path,
+        session_id: Optional[str],
+    ) -> None:
+        if not session_id:
+            return
+
+        entries = _load_history_entries(group_dir)
+        if not entries:
+            return
+
+        session_indices = [
+            index
+            for index, entry in enumerate(entries)
+            if isinstance(entry, dict)
+            and entry.get("session_id") == session_id
+        ]
+        if not session_indices:
+            return
+
+        latest_index = session_indices[-1]
+        latest = entries[latest_index]
+        if not isinstance(latest, dict):
+            return
+
+        analysis_text = latest.get("analysisText")
+        if isinstance(analysis_text, str) and analysis_text.strip().upper() == "SUCCESS":
+            latest["analysisText"] = ""
+            entries[latest_index] = latest
+            _save_history_entries(group_dir, entries)
+            _debug_log(
+                "Cleared SUCCESS analysis for force analyze",
+                session_id=session_id,
+                index=int(latest_index),
+            )
+
     def execute(
         self,
         instruction: str,
@@ -403,6 +490,10 @@ class DirectorGemini:
         api_key: str,
         link_id: str,
         latest_image: Optional[torch.Tensor] = None,
+        expand_system_instruction: str = "",
+        review_system_instruction: str = "",
+        force_review_system_instruction: str = "",
+        **kwargs: Any,
     ) -> Tuple[str]:
         _debug_log(
             "Execute called",
@@ -417,6 +508,14 @@ class DirectorGemini:
         group_dir = _resolve_group_dir(link_id)
         session_id = _active_session_id(group_dir)
         latest_pil: Optional[Image.Image] = None
+        raw_force_analyze = kwargs.get("force_analyze")
+        force_analyze = False
+        if isinstance(raw_force_analyze, str):
+            force_analyze = raw_force_analyze.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            force_analyze = bool(raw_force_analyze)
+        raw_feedback = kwargs.get("force_feedback", "")
+        force_feedback = raw_feedback if isinstance(raw_feedback, str) else ""
         try:
             initial_images = _tensor_to_pil_list(initial_image)
             if not initial_images:
@@ -435,6 +534,9 @@ class DirectorGemini:
             elif not session_id:
                 session_id = _start_new_session(group_dir, instruction)
 
+            if force_analyze and session_id:
+                self._clear_latest_success_entry(group_dir, session_id)
+
             history = self._load_history_for_prompt(
                 group_dir,
                 session_id,
@@ -447,14 +549,37 @@ class DirectorGemini:
                 session_id=session_id,
             )
 
+            expand_override = (expand_system_instruction or "").strip()
+            review_override = (review_system_instruction or "").strip()
+            force_review_override = (force_review_system_instruction or "").strip()
+
+            if force_analyze and latest_pil is None:
+                _debug_log(
+                    "Force analyze requested without latest image; disabling force mode",
+                    session_id=session_id,
+                )
+                force_analyze = False
+                force_feedback = ""
+
             if mode == "expand":
                 contents, system_instruction = self._build_expand_contents(
                     instruction, initial_images[0]
                 )
+                system_instruction = expand_override or system_instruction
             else:
                 contents, system_instruction = self._build_review_contents(
-                    instruction, initial_images[0], latest_pil, history
+                    instruction,
+                    initial_images[0],
+                    latest_pil,
+                    history,
+                    force_analyze,
+                    force_feedback,
                 )
+                if force_analyze:
+                    override = force_review_override or review_override
+                else:
+                    override = review_override
+                system_instruction = override or system_instruction
             _debug_log("Built contents", parts=len(contents), system_instruction=system_instruction[:40])
 
             response_text = _call_gemini(api_key, model, contents, system_instruction).strip()
