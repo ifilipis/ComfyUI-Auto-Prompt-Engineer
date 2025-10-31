@@ -255,6 +255,10 @@ class DirectorGemini:
                     "STRING",
                     {"default": "", "multiline": True},
                 ),
+                "force_review_system_instruction": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
             },
             "hidden": {
                 "link_id": ("STRING", {"default": ""}),
@@ -488,6 +492,7 @@ class DirectorGemini:
         latest_image: Optional[torch.Tensor] = None,
         expand_system_instruction: str = "",
         review_system_instruction: str = "",
+        force_review_system_instruction: str = "",
         **kwargs: Any,
     ) -> Tuple[str]:
         _debug_log(
@@ -546,6 +551,7 @@ class DirectorGemini:
 
             expand_override = (expand_system_instruction or "").strip()
             review_override = (review_system_instruction or "").strip()
+            force_review_override = (force_review_system_instruction or "").strip()
 
             if force_analyze and latest_pil is None:
                 _debug_log(
@@ -569,7 +575,11 @@ class DirectorGemini:
                     force_analyze,
                     force_feedback,
                 )
-                system_instruction = review_override or system_instruction
+                if force_analyze:
+                    override = force_review_override or review_override
+                else:
+                    override = review_override
+                system_instruction = override or system_instruction
             _debug_log("Built contents", parts=len(contents), system_instruction=system_instruction[:40])
 
             response_text = _call_gemini(api_key, model, contents, system_instruction).strip()

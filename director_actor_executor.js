@@ -234,6 +234,7 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       isCancelling: false,
       iter: 0,
       status: "Idle",
+      forceAnalyzeFeedback: "",
     };
     this.lastDirectorStatus = null;
     this.stopGateEngaged = false;
@@ -256,6 +257,12 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
         Math.max(1, ensureInteger(value, 1));
     }
     this.setMaxLoops(this.properties.maxLoops);
+    this.forceAnalyzeFeedbackWidget = this.addWidget(
+      "text",
+      "Force feedback",
+      this.properties.forceAnalyzeFeedback,
+      (value) => this.setForceAnalyzeFeedback(value || "")
+    );
     this.addWidget("button", "Run", null, () => this.startExecution());
     this.addWidget("button", "Cancel", null, () => this.cancelExecution());
     this.addWidget("button", "Force Analyze", null, () => this.forceAnalyze());
@@ -269,9 +276,19 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
     }
   }
 
+  setForceAnalyzeFeedback(value) {
+    const normalized = typeof value === "string" ? value : "";
+    this.properties.forceAnalyzeFeedback = normalized;
+    if (this.forceAnalyzeFeedbackWidget) {
+      this.forceAnalyzeFeedbackWidget.value = normalized;
+    }
+  }
+
   onPropertyChanged(name, value) {
     if (name === "maxLoops") {
       this.setMaxLoops(value);
+    } else if (name === "forceAnalyzeFeedback") {
+      this.setForceAnalyzeFeedback(value);
     }
   }
 
@@ -347,7 +364,11 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
       return;
     }
 
-    await this.startExecution({ reuseLink: true, forceAnalyze: true });
+    await this.startExecution({
+      reuseLink: true,
+      forceAnalyze: true,
+      forceFeedback: this.properties.forceAnalyzeFeedback || "",
+    });
   }
 
   async executeLoop() {
