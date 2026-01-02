@@ -8,12 +8,20 @@ You are creating a custom ComfyUI node. You must update this document with issue
 - Director executor must wait for explicit Gemini status updates before scheduling actors so SUCCESS halts the loop cleanly.
 - Hidden link routing inputs should stay internal to avoid exposing manual wiring in the graph UI.
 - Fallback queuing must dispatch each phase only once so actor targets do not double-submit and block director reruns.
+- Qwen3-VL support is missing, so there are no nodes for loading and running Qwen3-VL checkpoints.
+- Model configuration data for Qwen3-VL checkpoints is absent, preventing selection of Qwen3-VL variants.
+- The package does not declare transformer-based dependencies required for Qwen3-VL execution.
+- Nodes currently register under multiple categories, instead of sharing a single ComfyUI category (AutoPromptEngineer).
 
 ## Goals
 - Provide a single-output Gemini director node that emits control events.
 - Persist actor images via an Image Router node and notify the front-end.
 - Drive group execution loops and prompt slicing purely from front-end extensions.
 - Auto-manage persistence for history snapshots so review context survives between iterations.
+- Add Qwen3-VL nodes that can run multimodal prompts against Qwen3-VL backends.
+- Provide a Qwen3-VL model configuration list so users can select supported checkpoints.
+- Ensure required dependencies for Qwen3-VL nodes are documented in the package requirements.
+- Align all node categories so every node appears under the same ComfyUI category (AutoPromptEngineer).
 
 ## Tasks
 - Implement `DirectorGemini` and `ImageRouter` classes with required payloads and events.
@@ -30,3 +38,7 @@ You are creating a custom ComfyUI node. You must update this document with issue
 - Add a force analyze control that reuses the active session, clears SUCCESS history entries, and reruns the review loop.
 - Expose a force analyze feedback input on the DirectorActorExecutor UI so user critiques persist across reruns.
 - Provide a dedicated force analyze system instruction override on DirectorGemini for tailored review prompts.
+- Create Qwen3-VL node implementations (basic + advanced) that load checkpoints and run multimodal prompts.
+- Add a Qwen3-VL model config file listing the supported checkpoints and defaults.
+- Update requirements to include transformer stack dependencies needed for Qwen3-VL execution.
+- Register all nodes under the shared ComfyUI category (AutoPromptEngineer).

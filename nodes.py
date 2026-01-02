@@ -231,7 +231,7 @@ def _call_gemini(
 class DirectorGemini:
     """Single-output Gemini director node."""
 
-    CATEGORY = "Director/Gemini"
+    CATEGORY = "AutoPromptEngineer"
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("prompt",)
     FUNCTION = "execute"
@@ -624,7 +624,7 @@ class DirectorGemini:
 class ImageRouterSink:
     """Persist images, update the latest pointer, and notify the front-end."""
 
-    CATEGORY = "Director/IO"
+    CATEGORY = "AutoPromptEngineer"
     OUTPUT_NODE = True
     RETURN_TYPES = ()
     RETURN_NAMES = ()
@@ -734,7 +734,7 @@ class ImageRouterSink:
 class LatestImageSource:
     """Load the most recent actor image as a tensor."""
 
-    CATEGORY = "Director/IO"
+    CATEGORY = "AutoPromptEngineer"
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image",)
     FUNCTION = "load"
