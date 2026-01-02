@@ -12,6 +12,7 @@ You are creating a custom ComfyUI node. You must update this document with issue
 - Model configuration data for Qwen3-VL checkpoints is absent, preventing selection of Qwen3-VL variants.
 - The package does not declare transformer-based dependencies required for Qwen3-VL execution.
 - Nodes currently register under multiple categories, instead of sharing a single ComfyUI category (AutoPromptEngineer).
+- Director-style orchestration is missing for Qwen3-VL, so Qwen nodes cannot drive the same loop behavior as DirectorGemini.
 
 ## Goals
 - Provide a single-output Gemini director node that emits control events.
@@ -22,6 +23,7 @@ You are creating a custom ComfyUI node. You must update this document with issue
 - Provide a Qwen3-VL model configuration list so users can select supported checkpoints.
 - Ensure required dependencies for Qwen3-VL nodes are documented in the package requirements.
 - Align all node categories so every node appears under the same ComfyUI category (AutoPromptEngineer).
+- Provide a Qwen3-VL director node that mirrors DirectorGemini behavior.
 
 ## Tasks
 - Implement `DirectorGemini` and `ImageRouter` classes with required payloads and events.
@@ -42,3 +44,4 @@ You are creating a custom ComfyUI node. You must update this document with issue
 - Add a Qwen3-VL model config file listing the supported checkpoints and defaults.
 - Update requirements to include transformer stack dependencies needed for Qwen3-VL execution.
 - Register all nodes under the shared ComfyUI category (AutoPromptEngineer).
+- Add a DirectorQwen3VL node that mirrors DirectorGemini history handling and director-status events.
