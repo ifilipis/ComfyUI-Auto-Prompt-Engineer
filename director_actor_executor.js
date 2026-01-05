@@ -769,6 +769,6 @@ class DirectorActorExecutorNode extends LiteGraph.LGraphNode {
 app.registerExtension({
   name: "DirectorActorExecutor",
   registerCustomNodes() {
-    LiteGraph.registerNodeType("director/DirectorActorExecutor", DirectorActorExecutorNode);
+    LiteGraph.registerNodeType("AutoPromptEngineer/DirectorActorExecutor", DirectorActorExecutorNode);
   },
 });

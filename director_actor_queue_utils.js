@@ -93,11 +93,15 @@ export function buildFilteredPrompt(originalBody, targetIdsIterable) {
       }
       if (
         nodeData.class_type === "DirectorGemini" ||
+        nodeData.class_type === "DirectorQwen3VL" ||
         nodeData.class_type === "ImageRouterSink" ||
         nodeData.class_type === "LatestImageSource"
       ) {
         nodeData.inputs.link_id = linkId;
-        if (nodeData.class_type === "DirectorGemini") {
+        if (
+          nodeData.class_type === "DirectorGemini" ||
+          nodeData.class_type === "DirectorQwen3VL"
+        ) {
           nodeData.inputs.force_analyze = Boolean(daeState.forceAnalyze);
           const feedback = daeState.forceAnalyzeFeedback;
           nodeData.inputs.force_feedback =

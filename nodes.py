@@ -18,6 +18,13 @@ from PIL import Image
 
 from server import PromptServer
 
+from .qwen3_vl_nodes import (
+    ATTENTION_MODES as QWEN_ATTENTION_MODES,
+    QWEN3_VL_MODELS,
+    Qwen3VLBase,
+    Quantization as QwenQuantization,
+)
+
 try:
     import google.generativeai as genai
 except ImportError as exc:  # pragma: no cover - dependency error surfaced at runtime
@@ -231,7 +238,7 @@ def _call_gemini(
 class DirectorGemini:
     """Single-output Gemini director node."""
 
-    CATEGORY = "Director/Gemini"
+    CATEGORY = "AutoPromptEngineer"
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("prompt",)
     FUNCTION = "execute"
@@ -621,10 +628,466 @@ class DirectorGemini:
         return (prompt_output,)
 
 
+class DirectorQwen3VL(DirectorGemini):
+    """Single-output Qwen3-VL director node."""
+
+    CATEGORY = "AutoPromptEngineer"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "execute"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._backend = Qwen3VLBase()
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        models = list(QWEN3_VL_MODELS.keys())
+        default_model = next(
+            (name for name, info in QWEN3_VL_MODELS.items() if info.get("default")), None
+        )
+        default_model = default_model or (models[0] if models else "Qwen3-VL-4B-Instruct")
+        num_gpus = torch.cuda.device_count()
+        gpu_list = [f"cuda:{i}" for i in range(num_gpus)]
+        device_options = ["auto", "cpu", "mps"] + gpu_list
+        return {
+            "required": {
+                "instruction": ("STRING", {"default": "", "multiline": True}),
+                "initial_image": ("IMAGE",),
+                "model_name": (models, {"default": default_model}),
+                "quantization": (QwenQuantization.get_values(), {"default": QwenQuantization.FP16.value}),
+                "attention_mode": (QWEN_ATTENTION_MODES, {"default": "auto"}),
+                "use_torch_compile": ("BOOLEAN", {"default": False}),
+                "device": (device_options, {"default": "auto"}),
+                "max_tokens": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "temperature": ("FLOAT", {"default": 0.6, "min": 0.1, "max": 1.0}),
+                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0}),
+                "num_beams": ("INT", {"default": 1, "min": 1, "max": 8}),
+                "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0}),
+                "frame_count": ("INT", {"default": 16, "min": 1, "max": 64}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
+            },
+            "optional": {
+                "latest_image": ("IMAGE",),
+                "expand_system_instruction": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
+                "review_system_instruction": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
+                "force_review_system_instruction": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
+            },
+            "hidden": {
+                "link_id": ("STRING", {"default": ""}),
+                "force_analyze": ("BOOLEAN", {"default": False}),
+                "force_feedback": ("STRING", {"default": ""}),
+            },
+        }
+
+    @staticmethod
+    def _load_history_for_qwen(
+        group_dir: Path,
+        session_id: Optional[str],
+        include_latest: bool,
+    ) -> List[Dict[str, Any]]:
+        if not session_id:
+            return []
+
+        entries = [
+            entry
+            for entry in _load_history_entries(group_dir)
+            if isinstance(entry, dict)
+            and entry.get("session_id") == session_id
+        ]
+        if not include_latest and entries:
+            entries = entries[:-1]
+
+        history: List[Dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            image_key = entry.get("image_path")
+            record: Dict[str, Any] = {}
+            if isinstance(image_key, str) and image_key:
+                image_path = group_dir / image_key
+                if image_path.exists():
+                    record["image"] = Image.open(image_path).convert("RGB")
+            analysis_text = entry.get("analysisText")
+            if isinstance(analysis_text, str) and analysis_text.strip():
+                record["analysisText"] = analysis_text
+            if record:
+                history.append(record)
+        return history
+
+    @staticmethod
+    def _update_latest_history_entry(
+        group_dir: Path,
+        session_id: Optional[str],
+        response_text: str,
+        done: bool,
+    ) -> None:
+        if not session_id:
+            return
+
+        entries = _load_history_entries(group_dir)
+        if not entries:
+            return
+
+        session_indices = [
+            index
+            for index, entry in enumerate(entries)
+            if isinstance(entry, dict)
+            and entry.get("session_id") == session_id
+        ]
+        if not session_indices:
+            return
+
+        latest_index = session_indices[-1]
+        latest = entries[latest_index]
+        if not isinstance(latest, dict):
+            return
+        latest["analysisText"] = "SUCCESS" if done else response_text
+        entries[latest_index] = latest
+        _save_history_entries(group_dir, entries)
+
+    @staticmethod
+    def _clear_latest_success_entry(
+        group_dir: Path,
+        session_id: Optional[str],
+    ) -> None:
+        if not session_id:
+            return
+
+        entries = _load_history_entries(group_dir)
+        if not entries:
+            return
+
+        session_indices = [
+            index
+            for index, entry in enumerate(entries)
+            if isinstance(entry, dict)
+            and entry.get("session_id") == session_id
+        ]
+        if not session_indices:
+            return
+
+        latest_index = session_indices[-1]
+        latest = entries[latest_index]
+        if not isinstance(latest, dict):
+            return
+
+        analysis_text = latest.get("analysisText")
+        if isinstance(analysis_text, str) and analysis_text.strip().upper() == "SUCCESS":
+            latest["analysisText"] = ""
+            entries[latest_index] = latest
+            _save_history_entries(group_dir, entries)
+            _debug_log(
+                "Cleared SUCCESS analysis for force analyze",
+                session_id=session_id,
+                index=int(latest_index),
+            )
+
+    def _build_qwen_conversation(
+        self,
+        instruction: str,
+        initial: Image.Image,
+        latest: Optional[Image.Image],
+        history: Iterable[Dict[str, Any]],
+        force_analyze: bool,
+        feedback: str,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        conversation: List[Dict[str, Any]] = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": initial},
+                    {"type": "text", "text": f'My instruction is: "{instruction}"'},
+                ],
+            }
+        ]
+
+        for step in history:
+            image = step.get("image") if isinstance(step, dict) else None
+            if isinstance(image, Image.Image):
+                conversation.append({"role": "assistant", "content": [{"type": "image", "image": image}]})
+            analysis_text = step.get("analysisText") if isinstance(step, dict) else None
+            if isinstance(analysis_text, str) and analysis_text.strip():
+                conversation.append({"role": "assistant", "content": [{"type": "text", "text": analysis_text}]})
+
+        if latest is not None:
+            conversation.append({"role": "assistant", "content": [{"type": "image", "image": latest}]})
+
+        if force_analyze:
+            prompt_text = feedback.strip()
+            if prompt_text:
+                prompt_text = (
+                    f"{prompt_text}. Re-analyze your work, find the flaw, and provide the detailed, "
+                    "first-person critique as instructed."
+                )
+            else:
+                prompt_text = (
+                    "The image still failed to meet the instructions. Re-analyze your work, find the flaw, "
+                    "and provide the detailed, first-person critique as instructed."
+                )
+            conversation.append({"role": "user", "content": [{"type": "text", "text": prompt_text}]})
+            return conversation, _FORCE_REVIEW_SYSTEM_INSTRUCTION
+
+        conversation.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Look at the image and analyze if you failed to follow the instruction. "
+                            "If you succeeded, respond with SUCCESS. Otherwise, provide a corrected prompt."
+                        ),
+                    }
+                ],
+            }
+        )
+        return conversation, _REVIEW_SYSTEM_INSTRUCTION
+
+    def _qwen_generate(
+        self,
+        conversation: List[Dict[str, Any]],
+        system_instruction: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        num_beams: int,
+        repetition_penalty: float,
+    ) -> str:
+        images = [
+            item["image"]
+            for message in conversation
+            for item in message.get("content", [])
+            if item.get("type") == "image"
+        ]
+        chat = self._backend.processor.apply_chat_template(
+            conversation, tokenize=False, add_generation_prompt=True
+        )
+        if system_instruction.strip():
+            chat = f"{system_instruction.strip()}\n\n{chat}"
+        processed = self._backend.processor(
+            text=chat, images=images or None, videos=None, return_tensors="pt"
+        )
+        model_device = next(self._backend.model.parameters()).device
+        model_inputs = {
+            key: value.to(model_device) if torch.is_tensor(value) else value
+            for key, value in processed.items()
+        }
+        stop_tokens = [self._backend.tokenizer.eos_token_id]
+        if hasattr(self._backend.tokenizer, "eot_id") and self._backend.tokenizer.eot_id is not None:
+            stop_tokens.append(self._backend.tokenizer.eot_id)
+        kwargs = {
+            "max_new_tokens": max_tokens,
+            "repetition_penalty": repetition_penalty,
+            "num_beams": num_beams,
+            "eos_token_id": stop_tokens,
+            "pad_token_id": self._backend.tokenizer.pad_token_id,
+        }
+        if num_beams == 1:
+            kwargs.update({"do_sample": True, "temperature": temperature, "top_p": top_p})
+        else:
+            kwargs["do_sample"] = False
+        outputs = self._backend.model.generate(**model_inputs, **kwargs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        input_len = model_inputs["input_ids"].shape[-1]
+        text = self._backend.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
+        return text.strip()
+
+    def execute(
+        self,
+        instruction: str,
+        initial_image: torch.Tensor,
+        model_name: str,
+        quantization: str,
+        attention_mode: str,
+        use_torch_compile: bool,
+        device: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        num_beams: int,
+        repetition_penalty: float,
+        frame_count: int,
+        keep_model_loaded: bool,
+        seed: int,
+        link_id: str,
+        latest_image: Optional[torch.Tensor] = None,
+        expand_system_instruction: str = "",
+        review_system_instruction: str = "",
+        force_review_system_instruction: str = "",
+        **kwargs: Any,
+    ) -> Tuple[str]:
+        _debug_log(
+            "Execute called",
+            link_id=link_id,
+            has_latest=latest_image is not None,
+            instruction_chars=len(instruction or ""),
+        )
+        prompt_output = ""
+        event_prompt = ""
+        done = False
+
+        group_dir = _resolve_group_dir(link_id)
+        session_id = _active_session_id(group_dir)
+        latest_pil: Optional[Image.Image] = None
+        raw_force_analyze = kwargs.get("force_analyze")
+        force_analyze = False
+        if isinstance(raw_force_analyze, str):
+            force_analyze = raw_force_analyze.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            force_analyze = bool(raw_force_analyze)
+        raw_feedback = kwargs.get("force_feedback", "")
+        force_feedback = raw_feedback if isinstance(raw_feedback, str) else ""
+
+        try:
+            torch.manual_seed(seed)
+            initial_images = _tensor_to_pil_list(initial_image)
+            if not initial_images:
+                raise ValueError("Initial image tensor is empty.")
+            _debug_log("Initial image processed", count=len(initial_images))
+
+            if latest_image is not None:
+                latest_list = _tensor_to_pil_list(latest_image)
+                if latest_list:
+                    latest_pil = latest_list[0]
+            _debug_log("Latest image state", available=latest_pil is not None)
+
+            mode = "expand" if latest_pil is None else "review"
+            if mode == "expand":
+                session_id = _start_new_session(group_dir, instruction)
+            elif not session_id:
+                session_id = _start_new_session(group_dir, instruction)
+
+            if force_analyze and session_id:
+                self._clear_latest_success_entry(group_dir, session_id)
+
+            history = self._load_history_for_qwen(
+                group_dir,
+                session_id,
+                include_latest=latest_pil is None,
+            )
+            if isinstance(frame_count, int) and frame_count > 0 and len(history) > frame_count:
+                history = history[-frame_count:]
+            _debug_log(
+                "Resolved mode",
+                mode=mode,
+                history_entries=len(history),
+                session_id=session_id,
+            )
+
+            expand_override = (expand_system_instruction or "").strip()
+            review_override = (review_system_instruction or "").strip()
+            force_review_override = (force_review_system_instruction or "").strip()
+
+            if force_analyze and latest_pil is None:
+                _debug_log(
+                    "Force analyze requested without latest image; disabling force mode",
+                    session_id=session_id,
+                )
+                force_analyze = False
+                force_feedback = ""
+
+            if mode == "expand":
+                conversation = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": initial_images[0]},
+                            {"type": "text", "text": instruction},
+                        ],
+                    }
+                ]
+                system_instruction = expand_override or _EXPAND_SYSTEM_INSTRUCTION
+            else:
+                conversation, system_instruction = self._build_qwen_conversation(
+                    instruction,
+                    initial_images[0],
+                    latest_pil,
+                    history,
+                    force_analyze,
+                    force_feedback,
+                )
+                if force_analyze:
+                    override = force_review_override or review_override
+                else:
+                    override = review_override
+                system_instruction = override or system_instruction
+            _debug_log("Built contents", parts=len(conversation), system_instruction=system_instruction[:40])
+
+            self._backend.load_model(
+                model_name,
+                quantization,
+                attention_mode,
+                use_torch_compile,
+                device,
+                keep_model_loaded,
+            )
+
+            response_text = self._qwen_generate(
+                conversation,
+                system_instruction,
+                max_tokens,
+                temperature,
+                top_p,
+                num_beams,
+                repetition_penalty,
+            ).strip()
+            _debug_log(
+                "Qwen3-VL response received",
+                empty=not bool(response_text),
+                preview=response_text[:80],
+            )
+
+            if mode == "expand":
+                prompt_output = response_text or instruction
+                event_prompt = prompt_output
+                done = False
+            else:
+                if response_text.upper() == "SUCCESS":
+                    prompt_output = "SUCCESS"
+                    event_prompt = ""
+                    done = True
+                else:
+                    prompt_output = response_text or instruction
+                    event_prompt = prompt_output
+                    done = False
+
+        except Exception as exc:  # pragma: no cover - runtime safety
+            prompt_output = f"<director_error:{exc}>"
+            event_prompt = prompt_output
+            done = True
+            _debug_log("Execute failed", error=str(exc))
+        finally:
+            if not keep_model_loaded:
+                self._backend.clear()
+
+        self._send_event(link_id, done, event_prompt)
+        if latest_pil is not None:
+            self._update_latest_history_entry(group_dir, session_id, prompt_output, done)
+        _debug_log(
+            "Execute completed",
+            done=done,
+            prompt_preview=prompt_output[:80],
+            event_prompt_preview=event_prompt[:80],
+        )
+        return (prompt_output,)
+
+
 class ImageRouterSink:
     """Persist images, update the latest pointer, and notify the front-end."""
 
-    CATEGORY = "Director/IO"
+    CATEGORY = "AutoPromptEngineer"
     OUTPUT_NODE = True
     RETURN_TYPES = ()
     RETURN_NAMES = ()
@@ -734,7 +1197,7 @@ class ImageRouterSink:
 class LatestImageSource:
     """Load the most recent actor image as a tensor."""
 
-    CATEGORY = "Director/IO"
+    CATEGORY = "AutoPromptEngineer"
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image",)
     FUNCTION = "load"
@@ -789,6 +1252,7 @@ class LatestImageSource:
 
 NODE_CLASS_MAPPINGS = {
     "DirectorGemini": DirectorGemini,
+    "DirectorQwen3VL": DirectorQwen3VL,
     "ImageRouterSink": ImageRouterSink,
     "LatestImageSource": LatestImageSource,
 }
@@ -796,6 +1260,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DirectorGemini": "Director (Gemini, single prompt)",
+    "DirectorQwen3VL": "Director (Qwen3-VL, single prompt)",
     "ImageRouterSink": "Image Router Sink (persist + latest)",
     "LatestImageSource": "Latest Image Source",
 }
